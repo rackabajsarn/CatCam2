@@ -1,4 +1,4 @@
-#define MQTT_MAX_PACKET_SIZE 16384
+#define MQTT_MAX_PACKET_SIZE 65535
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <esp_camera.h>
@@ -15,6 +15,7 @@ const char* password = WIFI_PASSWORD;
 // MQTT topics
 #define COMMAND_TOPIC "catflap/command"
 #define DEBUG_TOPIC "catflap/debug"
+#define ALERT_TOPIC "catflap/alert"
 #define IMAGE_TOPIC "catflap/image"
 #define IR_BARRIER_TOPIC "catflap/ir_barrier"
 #define FLAP_STATE_TOPIC "catflap/flap_state"
@@ -42,10 +43,9 @@ const char* password = WIFI_PASSWORD;
 #define EEPROM_ADDRESS_CAMERA_SETTINGS 3  // Starting address for camera settings
 
 // GPIO Definitions
-#define IR_PIN          33
-#define OPEN_SENSOR_PIN 32
-#define MOTOR_OPEN_PIN  14
-#define MOTOR_CLOSE_PIN 13
+#define IR_PIN          32
+//#define OPEN_SENSOR_PIN 32
+#define ENABLE_FLAP_PIN 33 //TODO: Double check 13 or 14
 
 // Camera pin configuration
 #define PWDN_GPIO_NUM    -1
@@ -110,13 +110,14 @@ bool detectionModeEnabled = true;
 bool mqttDebugEnabled = true;
 String catLocation = "Home";
 bool barrierTriggered = false;  // Flag to indicate barrier has been triggered
+bool barrierStableState = false; // Last confirmed stable state (false = not broken, true = broken)
 
 // Timer for saving settings
 unsigned long lastSettingsChangeTime = 0;
 const unsigned long SETTINGS_SAVE_DELAY = 15000; // 15 seconds
 
 // Debounce and Cooldown Settings
-#define DEBOUNCE_DURATION_MS 20  // Debounce duration in milliseconds
+#define DEBOUNCE_DURATION_MS 50  // Debounce duration in milliseconds
 float cooldownDuration = 0.0;    // Cooldown duration in seconds (default to 0)
 unsigned long lastTriggerTime = 0;     // Timestamp of the last valid trigger
 unsigned long debounceStartTime = 0;   // Timestamp when debounce started
@@ -125,6 +126,8 @@ bool debounceActive = false;           // Flag to indicate debounce is in progre
 
 void setup() {
   Serial.begin(115200);
+
+  initCamera();
 
   // Initialize EEPROM
   EEPROM.begin(EEPROM_SIZE);
@@ -135,12 +138,9 @@ void setup() {
   }
 
   // Initialize GPIOs
-  pinMode(IR_PIN, INPUT_PULLUP);
-  pinMode(OPEN_SENSOR_PIN, INPUT);
-  pinMode(MOTOR_OPEN_PIN, OUTPUT);
-  pinMode(MOTOR_CLOSE_PIN, OUTPUT);
-  digitalWrite(MOTOR_OPEN_PIN, LOW);
-  digitalWrite(MOTOR_CLOSE_PIN, LOW);
+  pinMode(IR_PIN, INPUT);
+  //pinMode(OPEN_SENSOR_PIN, INPUT);
+  pinMode(ENABLE_FLAP_PIN, OUTPUT);
 
   setup_wifi();
 
@@ -148,9 +148,8 @@ void setup() {
   client.setServer(MQTT_SERVER, 1883);
   client.setCallback(handleMqttMessages);
   client.setBufferSize(MQTT_MAX_PACKET_SIZE);
-
-  initCamera();
-  publishCameraSettings();  // Publish initial camera settings
+    
+  reconnect();
 
   setupOTA();  // Initialize OTA
 
@@ -189,6 +188,11 @@ void initializeEEPROM() {
 }
 
 void loop() {
+  // Reconnect to Wi-Fi if disconnected
+  if (WiFi.status() != WL_CONNECTED) {
+    setup_wifi();
+  }
+
   if (!client.connected()) {
     reconnect();
   }
@@ -229,8 +233,12 @@ void setup_wifi() {
 
 void reconnect() {
   while (!client.connected()) {
+    // Generate a unique client ID using the MAC address
+    String clientId = "ESP32Client-";
+    clientId += String(WiFi.macAddress());
+
     Serial.print("Attempting MQTT connection...");
-    if (client.connect("ESP32Client")) {
+    if (client.connect(clientId.c_str())) {
       Serial.println("connected");
       // Subscribe to command topics
       client.subscribe(COMMAND_TOPIC);
@@ -246,7 +254,7 @@ void reconnect() {
       client.subscribe(COOLDOWN_SET_TOPIC);
 
       // Add subscriptions for other settings
-      mqttDebugPrintf("MQTT buffer size set to: %d bytes\n", client.getBufferSize());
+      //mqttDebugPrintf("MQTT buffer size set to: %d bytes\n", client.getBufferSize());
 
       // Publish discovery configs
       publishDiscoveryConfigs();
@@ -297,7 +305,7 @@ void initCamera() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.fb_location = CAMERA_FB_IN_DRAM;  // Use internal DRAM
+  config.fb_location = CAMERA_FB_IN_PSRAM;  // Use internal DRAM
 
   // Frame parameters
   config.frame_size   = FRAMESIZE_VGA;
@@ -341,43 +349,19 @@ void captureAndSendImage() {
   esp_camera_fb_return(fb);
 }
 
-void openFlap(int duration) {
+void enableFlap() {
   // Open the flap
-  digitalWrite(MOTOR_OPEN_PIN, HIGH);
-  digitalWrite(MOTOR_CLOSE_PIN, LOW);
+  digitalWrite(ENABLE_FLAP_PIN, LOW);
 
-  flapState = "opening";
+  flapState = "Open";
   client.publish(FLAP_STATE_TOPIC, flapState.c_str(), true);
-
-  delay(duration);
-
-  // Stop the motor
-  digitalWrite(MOTOR_OPEN_PIN, LOW);
-  digitalWrite(MOTOR_CLOSE_PIN, LOW);
-
-  flapState = "open";
-  client.publish(FLAP_STATE_TOPIC, flapState.c_str(), true);
-
-  // Optionally, close the flap after a delay
-  delay(1000); // Wait before closing
-  closeFlap();
 }
 
-void closeFlap() {
+void disableFlap() {
   // Close the flap
-  digitalWrite(MOTOR_OPEN_PIN, LOW);
-  digitalWrite(MOTOR_CLOSE_PIN, HIGH);
+  digitalWrite(ENABLE_FLAP_PIN, HIGH);
 
-  flapState = "closing";
-  client.publish(FLAP_STATE_TOPIC, flapState.c_str(), true);
-
-  delay(1000); // Adjust as needed
-
-  // Stop the motor
-  digitalWrite(MOTOR_OPEN_PIN, LOW);
-  digitalWrite(MOTOR_CLOSE_PIN, LOW);
-
-  flapState = "closed";
+  flapState = "Closed";
   client.publish(FLAP_STATE_TOPIC, flapState.c_str(), true);
 }
 
@@ -393,10 +377,10 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
   Serial.println(incomingMessage);
 
   if (String(topic) == COMMAND_TOPIC) {
-    if (incomingMessage.equalsIgnoreCase("open")) {
-      openFlap(1000);  // Open flap for 1 second
-    } else if (incomingMessage.equalsIgnoreCase("close")) {
-      closeFlap();
+    if (incomingMessage.equalsIgnoreCase("enable_flap")) {
+      enableFlap();
+    } else if (incomingMessage.equalsIgnoreCase("disable_flap")) {
+      disableFlap();
     } else if (incomingMessage.equalsIgnoreCase("snapshot")) {
       captureAndSendImage();
     } else if (incomingMessage.equalsIgnoreCase("restart")) {
@@ -485,16 +469,16 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfo1 = irSensorConfig.createNestedObject("device");
   deviceInfo1["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfo1["name"] = "Cat Flap";
-  deviceInfo1["model"] = "Custom Cat Flap";
-  deviceInfo1["manufacturer"] = "YourName";
+  deviceInfo1["model"] = "AI Cat Flap";
+  deviceInfo1["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String irSensorConfigPayload;
   serializeJson(irSensorConfig, irSensorConfigPayload);
-  mqttDebugPrintf("Payload size for %s: %d bytes\n", irSensorConfigTopic.c_str(), irSensorConfigPayload.length());
-  mqttDebugPrintf("Free heap before publishing to %s: %d bytes\n", irSensorConfigTopic.c_str(), ESP.getFreeHeap());
+  //mqttDebugPrintf("Payload size for %s: %d bytes\n", irSensorConfigTopic.c_str(), irSensorConfigPayload.length());
+  //mqttDebugPrintf("Free heap before publishing to %s: %d bytes\n", irSensorConfigTopic.c_str(), ESP.getFreeHeap());
 
   if (client.publish(irSensorConfigTopic.c_str(), irSensorConfigPayload.c_str(), true))
   {
-    mqttDebugPrintln("irSensorConfigTopic - Sent");
+    //mqttDebugPrintln("irSensorConfigTopic - Sent");
   } else {
     mqttDebugPrintln("irSensorConfigTopic - Failed");
   }
@@ -508,14 +492,14 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfo2 = flapStateConfig.createNestedObject("device");
   deviceInfo2["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfo2["name"] = "Cat Flap";
-  deviceInfo2["model"] = "Custom Cat Flap";
-  deviceInfo2["manufacturer"] = "YourName";
+  deviceInfo2["model"] = "AI Cat Flap";
+  deviceInfo2["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String flapStateConfigPayload;
   serializeJson(flapStateConfig, flapStateConfigPayload);
-  mqttDebugPrintf("Payload size for %s: %d bytes\n", flapStateConfigTopic.c_str(), flapStateConfigPayload.length());
+  //mqttDebugPrintf("Payload size for %s: %d bytes\n", flapStateConfigTopic.c_str(), flapStateConfigPayload.length());
   if (client.publish(flapStateConfigTopic.c_str(), flapStateConfigPayload.c_str(), true))
   {
-    mqttDebugPrintln("flapStateConfigTopic - Sent");
+    //mqttDebugPrintln("flapStateConfigTopic - Sent");
   } else {
     mqttDebugPrintln("flapStateConfigTopic - Failed");
   }
@@ -525,20 +509,20 @@ void publishDiscoveryConfigs() {
   DynamicJsonDocument flapSwitchConfig(capacity);
   flapSwitchConfig["name"] = "Cat Flap Control";
   flapSwitchConfig["command_topic"] = COMMAND_TOPIC;
-  flapSwitchConfig["payload_on"] = "open";
-  flapSwitchConfig["payload_off"] = "close";
+  flapSwitchConfig["payload_on"] = "enable_flap";
+  flapSwitchConfig["payload_off"] = "disable_flap";
   flapSwitchConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_control";
   JsonObject deviceInfo3 = flapSwitchConfig.createNestedObject("device");
   deviceInfo3["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfo3["name"] = "Cat Flap";
-  deviceInfo3["model"] = "Custom Cat Flap";
-  deviceInfo3["manufacturer"] = "YourName";
+  deviceInfo3["model"] = "AI Cat Flap";
+  deviceInfo3["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String flapSwitchConfigPayload;
   serializeJson(flapSwitchConfig, flapSwitchConfigPayload);
-  mqttDebugPrintf("Payload size for %s: %d bytes\n", flapSwitchConfigTopic.c_str(), flapSwitchConfigPayload.length());
+  //mqttDebugPrintf("Payload size for %s: %d bytes\n", flapSwitchConfigTopic.c_str(), flapSwitchConfigPayload.length());
   if (client.publish(flapSwitchConfigTopic.c_str(), flapSwitchConfigPayload.c_str(), true))
   {
-    mqttDebugPrintln("flapSwitchConfigTopic - Sent");
+    //mqttDebugPrintln("flapSwitchConfigTopic - Sent");
   } else {
     mqttDebugPrintln("flapSwitchConfigTopic - Failed");
   }
@@ -555,8 +539,8 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfoDetection = detectionModeConfig.createNestedObject("device");
   deviceInfoDetection["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfoDetection["name"] = "Cat Flap";
-  deviceInfoDetection["model"] = "Custom Cat Flap";
-  deviceInfoDetection["manufacturer"] = "YourName";
+  deviceInfoDetection["model"] = "AI Cat Flap";
+  deviceInfoDetection["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String detectionModeConfigPayload;
   serializeJson(detectionModeConfig, detectionModeConfigPayload);
   client.publish(detectionModeConfigTopic.c_str(), detectionModeConfigPayload.c_str(), true);
@@ -570,8 +554,8 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfoCatLocation = catLocationConfig.createNestedObject("device");
   deviceInfoCatLocation["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfoCatLocation["name"] = "Cat Flap";
-  deviceInfoCatLocation["model"] = "Custom Cat Flap";
-  deviceInfoCatLocation["manufacturer"] = "YourName";
+  deviceInfoCatLocation["model"] = "AI Cat Flap";
+  deviceInfoCatLocation["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String catLocationConfigPayload;
   serializeJson(catLocationConfig, catLocationConfigPayload);
   client.publish(catLocationConfigTopic.c_str(), catLocationConfigPayload.c_str(), true);
@@ -586,8 +570,8 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfoSetHome = setHomeButtonConfig.createNestedObject("device");
   deviceInfoSetHome["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfoSetHome["name"] = "Cat Flap";
-  deviceInfoSetHome["model"] = "Custom Cat Flap";
-  deviceInfoSetHome["manufacturer"] = "YourName";
+  deviceInfoSetHome["model"] = "AI Cat Flap";
+  deviceInfoSetHome["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String setHomeButtonConfigPayload;
   serializeJson(setHomeButtonConfig, setHomeButtonConfigPayload);
   client.publish(setHomeButtonConfigTopic.c_str(), setHomeButtonConfigPayload.c_str(), true);
@@ -602,8 +586,8 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfoSetAway = setAwayButtonConfig.createNestedObject("device");
   deviceInfoSetAway["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfoSetAway["name"] = "Cat Flap";
-  deviceInfoSetAway["model"] = "Custom Cat Flap";
-  deviceInfoSetAway["manufacturer"] = "YourName";
+  deviceInfoSetAway["model"] = "AI Cat Flap";
+  deviceInfoSetAway["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String setAwayButtonConfigPayload;
   serializeJson(setAwayButtonConfig, setAwayButtonConfigPayload);
   client.publish(setAwayButtonConfigTopic.c_str(), setAwayButtonConfigPayload.c_str(), true);
@@ -620,8 +604,8 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfoDebugToggle = debugToggleConfig.createNestedObject("device");
   deviceInfoDebugToggle["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfoDebugToggle["name"] = "Cat Flap";
-  deviceInfoDebugToggle["model"] = "Custom Cat Flap";
-  deviceInfoDebugToggle["manufacturer"] = "YourName";
+  deviceInfoDebugToggle["model"] = "AI Cat Flap";
+  deviceInfoDebugToggle["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String debugToggleConfigPayload;
   serializeJson(debugToggleConfig, debugToggleConfigPayload);
   client.publish(debugToggleConfigTopic.c_str(), debugToggleConfigPayload.c_str(), true);
@@ -636,14 +620,14 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfo4 = cameraConfig.createNestedObject("device");
   deviceInfo4["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfo4["name"] = "Cat Flap";
-  deviceInfo4["model"] = "Custom Cat Flap";
-  deviceInfo4["manufacturer"] = "YourName";
+  deviceInfo4["model"] = "AI Cat Flap";
+  deviceInfo4["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String cameraConfigPayload;
   serializeJson(cameraConfig, cameraConfigPayload);
-  mqttDebugPrintf("Payload size for %s: %d bytes\n", cameraConfigTopic.c_str(), cameraConfigPayload.length());
+  //mqttDebugPrintf("Payload size for %s: %d bytes\n", cameraConfigTopic.c_str(), cameraConfigPayload.length());
   if (client.publish(cameraConfigTopic.c_str(), cameraConfigPayload.c_str(), true))
   {
-    mqttDebugPrintln("cameraConfigTopic - Sent");
+    //mqttDebugPrintln("cameraConfigTopic - Sent");
   } else {
     mqttDebugPrintln("cameraConfigTopic - Failed");
   }
@@ -659,12 +643,13 @@ void publishDiscoveryConfigs() {
   frameSizeOptions.add("QQVGA");
   frameSizeOptions.add("QVGA");
   frameSizeOptions.add("VGA");
+  frameSizeOptions.add("SVGA");
   // Add other frame sizes as needed
   JsonObject deviceInfoFrameSize = frameSizeConfig.createNestedObject("device");
   deviceInfoFrameSize["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfoFrameSize["name"] = "Cat Flap";
-  deviceInfoFrameSize["model"] = "Custom Cat Flap";
-  deviceInfoFrameSize["manufacturer"] = "YourName";
+  deviceInfoFrameSize["model"] = "AI Cat Flap";
+  deviceInfoFrameSize["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String frameSizeConfigPayload;
   serializeJson(frameSizeConfig, frameSizeConfigPayload);
   client.publish(frameSizeConfigTopic.c_str(), frameSizeConfigPayload.c_str(), true);
@@ -682,8 +667,8 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfoJpegQuality = jpegQualityConfig.createNestedObject("device");
   deviceInfoJpegQuality["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfoJpegQuality["name"] = "Cat Flap";
-  deviceInfoJpegQuality["model"] = "Custom Cat Flap";
-  deviceInfoJpegQuality["manufacturer"] = "YourName";
+  deviceInfoJpegQuality["model"] = "AI Cat Flap";
+  deviceInfoJpegQuality["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String jpegQualityConfigPayload;
   serializeJson(jpegQualityConfig, jpegQualityConfigPayload);
   client.publish(jpegQualityConfigTopic.c_str(), jpegQualityConfigPayload.c_str(), true);
@@ -701,8 +686,8 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfoBrightness = brightnessConfig.createNestedObject("device");
   deviceInfoBrightness["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfoBrightness["name"] = "Cat Flap";
-  deviceInfoBrightness["model"] = "Custom Cat Flap";
-  deviceInfoBrightness["manufacturer"] = "YourName";
+  deviceInfoBrightness["model"] = "AI Cat Flap";
+  deviceInfoBrightness["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String brightnessConfigPayload;
   serializeJson(brightnessConfig, brightnessConfigPayload);
   client.publish(brightnessConfigTopic.c_str(), brightnessConfigPayload.c_str(), true);
@@ -720,8 +705,8 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfoContrast = contrastConfig.createNestedObject("device");
   deviceInfoContrast["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfoContrast["name"] = "Cat Flap";
-  deviceInfoContrast["model"] = "Custom Cat Flap";
-  deviceInfoContrast["manufacturer"] = "YourName";
+  deviceInfoContrast["model"] = "AI Cat Flap";
+  deviceInfoContrast["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String contrastConfigPayload;
   serializeJson(contrastConfig, contrastConfigPayload);
   client.publish(contrastConfigTopic.c_str(), contrastConfigPayload.c_str(), true);
@@ -739,8 +724,8 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfoSaturation = saturationConfig.createNestedObject("device");
   deviceInfoSaturation["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfoSaturation["name"] = "Cat Flap";
-  deviceInfoSaturation["model"] = "Custom Cat Flap";
-  deviceInfoSaturation["manufacturer"] = "YourName";
+  deviceInfoSaturation["model"] = "AI Cat Flap";
+  deviceInfoSaturation["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String saturationConfigPayload;
   serializeJson(saturationConfig, saturationConfigPayload);
   client.publish(saturationConfigTopic.c_str(), saturationConfigPayload.c_str(), true);
@@ -757,8 +742,8 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfoAWB = awbConfig.createNestedObject("device");
   deviceInfoAWB["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfoAWB["name"] = "Cat Flap";
-  deviceInfoAWB["model"] = "Custom Cat Flap";
-  deviceInfoAWB["manufacturer"] = "YourName";
+  deviceInfoAWB["model"] = "AI Cat Flap";
+  deviceInfoAWB["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String awbConfigPayload;
   serializeJson(awbConfig, awbConfigPayload);
   client.publish(awbConfigTopic.c_str(), awbConfigPayload.c_str(), true);
@@ -782,8 +767,8 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfoEffect = specialEffectConfig.createNestedObject("device");
   deviceInfoEffect["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfoEffect["name"] = "Cat Flap";
-  deviceInfoEffect["model"] = "Custom Cat Flap";
-  deviceInfoEffect["manufacturer"] = "YourName";
+  deviceInfoEffect["model"] = "AI Cat Flap";
+  deviceInfoEffect["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String specialEffectConfigPayload;
   serializeJson(specialEffectConfig, specialEffectConfigPayload);
   client.publish(specialEffectConfigTopic.c_str(), specialEffectConfigPayload.c_str(), true);
@@ -798,8 +783,8 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfoSnapshot = snapshotButtonConfig.createNestedObject("device");
   deviceInfoSnapshot["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfoSnapshot["name"] = "Cat Flap";
-  deviceInfoSnapshot["model"] = "Custom Cat Flap";
-  deviceInfoSnapshot["manufacturer"] = "YourName";
+  deviceInfoSnapshot["model"] = "AI Cat Flap";
+  deviceInfoSnapshot["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String snapshotButtonConfigPayload;
   serializeJson(snapshotButtonConfig, snapshotButtonConfigPayload);
   client.publish(snapshotButtonConfigTopic.c_str(), snapshotButtonConfigPayload.c_str(), true);
@@ -814,8 +799,8 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfoRestart = restartButtonConfig.createNestedObject("device");
   deviceInfoRestart["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfoRestart["name"] = "Cat Flap";
-  deviceInfoRestart["model"] = "Custom Cat Flap";
-  deviceInfoRestart["manufacturer"] = "YourName";
+  deviceInfoRestart["model"] = "AI Cat Flap";
+  deviceInfoRestart["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String restartButtonConfigPayload;
   serializeJson(restartButtonConfig, restartButtonConfigPayload);
   client.publish(restartButtonConfigTopic.c_str(), restartButtonConfigPayload.c_str(), true);
@@ -832,11 +817,27 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfoDebug = debugSensorConfig.createNestedObject("device");
   deviceInfoDebug["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfoDebug["name"] = "Cat Flap";
-  deviceInfoDebug["model"] = "Custom Cat Flap";
-  deviceInfoDebug["manufacturer"] = "YourName";
+  deviceInfoDebug["model"] = "AI Cat Flap";
+  deviceInfoDebug["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String debugSensorConfigPayload;
   serializeJson(debugSensorConfig, debugSensorConfigPayload);
   client.publish(debugSensorConfigTopic.c_str(), debugSensorConfigPayload.c_str(), true);
+
+  // Alert Sensor
+  String alertSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/alert/config";
+  DynamicJsonDocument alertSensorConfig(512);
+  alertSensorConfig["name"] = "Cat Flap Alert";
+  alertSensorConfig["state_topic"] = ALERT_TOPIC;
+  alertSensorConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_alert";
+  alertSensorConfig["icon"] = "mdi:message-text";
+  JsonObject deviceInfoAlert = alertSensorConfig.createNestedObject("device");
+  deviceInfoAlert["identifiers"] = DEVICE_UNIQUE_ID;
+  deviceInfoAlert["name"] = "Cat Flap";
+  deviceInfoAlert["model"] = "AI Cat Flap";
+  deviceInfoAlert["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
+  String alertSensorConfigPayload;
+  serializeJson(alertSensorConfig, alertSensorConfigPayload);
+  client.publish(alertSensorConfigTopic.c_str(), alertSensorConfigPayload.c_str(), true);
 
   // Cooldown Number Entity
   String cooldownConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/cooldown/config";
@@ -852,8 +853,8 @@ void publishDiscoveryConfigs() {
   JsonObject deviceInfoCooldown = cooldownConfig.createNestedObject("device");
   deviceInfoCooldown["identifiers"] = DEVICE_UNIQUE_ID;
   deviceInfoCooldown["name"] = "Cat Flap";
-  deviceInfoCooldown["model"] = "Custom Cat Flap";
-  deviceInfoCooldown["manufacturer"] = "YourName";
+  deviceInfoCooldown["model"] = "AI Cat Flap";
+  deviceInfoCooldown["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String cooldownConfigPayload;
   serializeJson(cooldownConfig, cooldownConfigPayload);
   client.publish(cooldownConfigTopic.c_str(), cooldownConfigPayload.c_str(), true);
@@ -893,6 +894,8 @@ void handleFrameSizeCommand(String frameSizeStr) {
     newFrameSize = FRAMESIZE_QVGA;
   } else if (frameSizeStr.equalsIgnoreCase("VGA")) {
     newFrameSize = FRAMESIZE_VGA;
+  } else if (frameSizeStr.equalsIgnoreCase("SVGA")) {
+    newFrameSize = FRAMESIZE_SVGA;  
   } else {
     mqttDebugPrintln("Invalid frame size command");
     return;
@@ -1079,6 +1082,7 @@ void publishCameraSettings() {
       case FRAMESIZE_QQVGA: frameSizeStr = "QQVGA"; break;
       case FRAMESIZE_QVGA:  frameSizeStr = "QVGA";  break;
       case FRAMESIZE_VGA:   frameSizeStr = "VGA";   break;
+      case FRAMESIZE_SVGA:   frameSizeStr = "SVGA";   break;
       // Add other cases as needed
       default: frameSizeStr = "UNKNOWN"; break;
     }
@@ -1129,28 +1133,40 @@ void publishCooldownState() {
 
 void updateIRBarrierState() {
   // Read the current state of the IR barrier
-  int irBarrierState = digitalRead(IR_PIN);  // Assuming LOW means barrier is broken
+  bool irBarrierState = (digitalRead(IR_PIN) == LOW); // true = barrier broken, false = barrier intact
   unsigned long currentTime = millis();
 
-  if (irBarrierState == LOW) {
-    // Barrier is broken
+  if (irBarrierState != barrierStableState) {
+    // Detected a potential state change
     if (!debounceActive) {
+      // Start debouncing
       debounceActive = true;
       debounceStartTime = currentTime;
-    } else if (currentTime - debounceStartTime >= DEBOUNCE_DURATION_MS) {
-      // Debounce time met
-      if (!barrierTriggered) {
-        barrierTriggered = true;
-        handleIRBarrierStateChange(true);  // Barrier is broken
+      // Debugging Output
+      Serial.print("Potential state change detected. New state: ");
+      Serial.println(irBarrierState ? "Broken" : "Intact");
+    } else {
+      // Check if debounce duration has passed
+      if ((currentTime - debounceStartTime) >= DEBOUNCE_DURATION_MS) {
+        // Debounce time met, confirm the state change
+        barrierStableState = irBarrierState;
+        barrierTriggered = barrierStableState;
+        handleIRBarrierStateChange(barrierTriggered);
+        debounceActive = false;
+        // Debugging Output
+        Serial.print("State change confirmed. New state: ");
+        Serial.println(barrierTriggered ? "Broken" : "Intact");
       }
+      // If debounce duration not met, continue waiting
     }
   } else {
-    // Barrier is not broken
-    debounceActive = false;
-    if (barrierTriggered) {
-      barrierTriggered = false;
-      handleIRBarrierStateChange(false);  // Barrier is not broken
+    // No state change detected, reset debounce
+    if (debounceActive) {
+      debounceActive = false;
+      // Debugging Output
+      Serial.println("State reverted during debounce. Debounce reset.");
     }
+    // No action needed if already stable
   }
 }
 
