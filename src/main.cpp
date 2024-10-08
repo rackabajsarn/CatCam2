@@ -6,6 +6,7 @@
 #include <base64.h>
 #include <ArduinoJson.h>
 #include <EEPROM.h>
+#include "esp_system.h" // This is needed to use esp_reset_reason()
 #include "secrets.h"
 
 // Wi-Fi credentials from secrets.h
@@ -16,18 +17,20 @@ const char* password = WIFI_PASSWORD;
 #define COMMAND_TOPIC "catflap/command"
 #define DEBUG_TOPIC "catflap/debug"
 #define ALERT_TOPIC "catflap/alert"
+#define WIFI_SIGNAL_TOPIC "catflap/wifi_signal"
+#define IP_TOPIC "catflap/ip"
 #define IMAGE_TOPIC "catflap/image"
 #define IR_BARRIER_TOPIC "catflap/ir_barrier"
 #define FLAP_STATE_TOPIC "catflap/flap_state"
 #define DETECTION_MODE_TOPIC "catflap/detection_mode"
 #define CAT_LOCATION_TOPIC "catflap/cat_location"
 #define DEBUG_TOGGLE_TOPIC "catflap/debug_toggle"
-#define COOLDOWN_SET_TOPIC "catflap/cooldown/set"
 #define COOLDOWN_STATE_TOPIC "catflap/cooldown"
-#define DETECTION_MODE_SET_TOPIC "catflap/detection_mode/set"
-#define DEBUG_TOGGLE_SET_TOPIC "catflap/debug_toggle/set"
-
-
+#define SET_DETECTION_MODE_TOPIC "catflap/detection_mode/set"
+#define SET_DEBUG_TOGGLE_TOPIC "catflap/debug_toggle/set"
+#define SET_COOLDOWN_TOPIC "catflap/cooldown/set"
+#define SET_CAT_LOCATION_TOPIC "catflap/cat_location/set"
+#define SET_FLAP_STATE_TOPIC "catflap/flap_state/set"
 
 // Device information
 #define DEVICE_NAME "catflap"
@@ -67,16 +70,20 @@ const char* password = WIFI_PASSWORD;
 #define PCLK_GPIO_NUM    22
 
 // Forward declarations of functions
+void checkResetReason();
 void setup_wifi();
-void reconnect();
+void mqttConnect();
+void mqttReconnect();
 void initCamera();
 void captureAndSendImage();
-void openFlap(int duration);
-void closeFlap();
+void enableFlap();
+void disableFlap();
 void handleMqttMessages(char* topic, byte* payload, unsigned int length);
 void setupOTA();
 void publishDiscoveryConfigs();
 void publishCooldownState();
+void publishWifiSignalState();
+void publishIPState();
 void mqttDebugPrint(const char* message);
 void mqttDebugPrintln(const char* message);
 void mqttDebugPrintf(const char* format, ...);
@@ -95,6 +102,7 @@ void loadSettingsFromEEPROM();
 void handleDetectionModeCommand(String stateStr);
 void handleDebugToggleCommand(String stateStr);
 void handleCatLocationCommand(String locationStr);
+void handleFlapStateCommand(String stateStr);
 void updateIRBarrierState();
 bool isEEPROMInitialized();
 void initializeEEPROM();
@@ -105,16 +113,21 @@ PubSubClient client(espClient);
 
 // Global variables
 int lastIRState = HIGH;
-String flapState = "closed";  // Initialize flap state
+bool flapEnabled = true;  // Initialize flap state
 bool detectionModeEnabled = true;
 bool mqttDebugEnabled = true;
-String catLocation = "Home";
+bool catLocation = true; // true = home
 bool barrierTriggered = false;  // Flag to indicate barrier has been triggered
 bool barrierStableState = false; // Last confirmed stable state (false = not broken, true = broken)
 
 // Timer for saving settings
 unsigned long lastSettingsChangeTime = 0;
 const unsigned long SETTINGS_SAVE_DELAY = 15000; // 15 seconds
+
+// Timer for wifi signal update
+unsigned long lastWifiUpdateTime = 0;
+const unsigned long WIFI_UPDATE_INTERVAL = 15000; 
+
 
 // Debounce and Cooldown Settings
 #define DEBOUNCE_DURATION_MS 50  // Debounce duration in milliseconds
@@ -149,11 +162,65 @@ void setup() {
   client.setCallback(handleMqttMessages);
   client.setBufferSize(MQTT_MAX_PACKET_SIZE);
     
-  reconnect();
+  mqttConnect();
 
   setupOTA();  // Initialize OTA
-
+  checkResetReason();
+  publishIPState();
   mqttDebugPrintln("ESP Setup finished");
+}
+
+void loop() {
+  // Reconnect to Wi-Fi if disconnected
+  if (WiFi.status() != WL_CONNECTED) {
+    setup_wifi();
+  }
+
+  if (!client.connected()) {
+    mqttReconnect();
+  }
+  client.loop();
+
+  // Handle OTA updates
+  ArduinoOTA.handle();
+
+  // Handle IR barrier state
+  updateIRBarrierState();
+
+  // Save settings to EEPROM if needed
+  if (millis() - lastSettingsChangeTime > SETTINGS_SAVE_DELAY && lastSettingsChangeTime != 0) {
+    saveSettingsToEEPROM();
+    lastSettingsChangeTime = 0;  // Reset timer
+  }
+
+  publishWifiSignalState();
+  
+  delay(10);  // Small delay to prevent watchdog resets
+}
+
+void checkResetReason() {
+  esp_reset_reason_t reason = esp_reset_reason();
+
+  switch (reason) {
+    case ESP_RST_POWERON:
+      mqttDebugPrintln("Reset due to power on");
+      break;
+    case ESP_RST_SW:
+      mqttDebugPrintln("Reset due to software restart");
+      break;
+    case ESP_RST_PANIC:
+      mqttDebugPrintln("Reset due to exception/panic");
+      break;
+    case ESP_RST_INT_WDT:
+      mqttDebugPrintln("Reset due to interrupt watchdog");
+      break;
+    case ESP_RST_TASK_WDT:
+      mqttDebugPrintln("Reset due to task watchdog");
+      break;
+    default:
+      mqttDebugPrintln("Unknown reset reason");
+      break;
+    }
 }
 
 bool isEEPROMInitialized() {
@@ -187,32 +254,6 @@ void initializeEEPROM() {
   saveSettingsToEEPROM();
 }
 
-void loop() {
-  // Reconnect to Wi-Fi if disconnected
-  if (WiFi.status() != WL_CONNECTED) {
-    setup_wifi();
-  }
-
-  if (!client.connected()) {
-    reconnect();
-  }
-  client.loop();
-
-  // Handle OTA updates
-  ArduinoOTA.handle();
-
-  // Handle IR barrier state
-  updateIRBarrierState();
-
-  // Save settings to EEPROM if needed
-  if (millis() - lastSettingsChangeTime > SETTINGS_SAVE_DELAY && lastSettingsChangeTime != 0) {
-    saveSettingsToEEPROM();
-    lastSettingsChangeTime = 0;  // Reset timer
-  }
-
-  delay(10);  // Small delay to prevent watchdog resets
-}
-
 void setup_wifi() {
   Serial.println();
   Serial.print("Connecting to ");
@@ -226,12 +267,13 @@ void setup_wifi() {
     delay(500);
     Serial.print(".");
   }
+  
   Serial.println("\nWiFi connected");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 }
 
-void reconnect() {
+void mqttConnect() {
   while (!client.connected()) {
     // Generate a unique client ID using the MAC address
     String clientId = "ESP32Client-";
@@ -249,9 +291,11 @@ void reconnect() {
       client.subscribe("catflap/saturation/set");
       client.subscribe("catflap/awb/set");
       client.subscribe("catflap/special_effect/set");
-      client.subscribe(DETECTION_MODE_SET_TOPIC);
-      client.subscribe(DEBUG_TOGGLE_SET_TOPIC);
-      client.subscribe(COOLDOWN_SET_TOPIC);
+      client.subscribe(SET_DETECTION_MODE_TOPIC);
+      client.subscribe(SET_FLAP_STATE_TOPIC);
+      client.subscribe(SET_DEBUG_TOGGLE_TOPIC);
+      client.subscribe(SET_CAT_LOCATION_TOPIC);
+      client.subscribe(SET_COOLDOWN_TOPIC);
 
       // Add subscriptions for other settings
       //mqttDebugPrintf("MQTT buffer size set to: %d bytes\n", client.getBufferSize());
@@ -264,7 +308,6 @@ void reconnect() {
 
       publishCooldownState();
 
-
       // Publish detection mode state
       client.publish(DETECTION_MODE_TOPIC, detectionModeEnabled ? "ON" : "OFF", true);
 
@@ -272,7 +315,38 @@ void reconnect() {
       client.publish(DEBUG_TOGGLE_TOPIC, mqttDebugEnabled ? "ON" : "OFF", true);
 
       // Publish cat location
-      client.publish(CAT_LOCATION_TOPIC, catLocation.c_str(), true);
+      client.publish(CAT_LOCATION_TOPIC, catLocation ? "ON" : "OFF", true);
+
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" trying again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+void mqttReconnect() {
+  while (!client.connected()) {
+    // Generate a unique client ID using the MAC address
+    String clientId = "ESP32Client-";
+    clientId += String(WiFi.macAddress());
+
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect(clientId.c_str())) {
+      Serial.println("connected");
+      // Subscribe to command topics
+      client.subscribe(COMMAND_TOPIC);
+      client.subscribe("catflap/frame_size/set");
+      client.subscribe("catflap/jpeg_quality/set");
+      client.subscribe("catflap/brightness/set");
+      client.subscribe("catflap/contrast/set");
+      client.subscribe("catflap/saturation/set");
+      client.subscribe("catflap/awb/set");
+      client.subscribe("catflap/special_effect/set");
+      client.subscribe(SET_DETECTION_MODE_TOPIC);
+      client.subscribe(SET_DEBUG_TOGGLE_TOPIC);
+      client.subscribe(SET_COOLDOWN_TOPIC);
 
     } else {
       Serial.print("failed, rc=");
@@ -350,19 +424,17 @@ void captureAndSendImage() {
 }
 
 void enableFlap() {
-  // Open the flap
   digitalWrite(ENABLE_FLAP_PIN, LOW);
 
-  flapState = "Open";
-  client.publish(FLAP_STATE_TOPIC, flapState.c_str(), true);
+  flapEnabled = true;
+  client.publish(FLAP_STATE_TOPIC, flapEnabled ? "ON" : "OFF", true);
 }
 
 void disableFlap() {
-  // Close the flap
   digitalWrite(ENABLE_FLAP_PIN, HIGH);
 
-  flapState = "Closed";
-  client.publish(FLAP_STATE_TOPIC, flapState.c_str(), true);
+  flapEnabled = false;
+  client.publish(FLAP_STATE_TOPIC, flapEnabled ? "ON" : "OFF", true);
 }
 
 void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
@@ -377,16 +449,10 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
   Serial.println(incomingMessage);
 
   if (String(topic) == COMMAND_TOPIC) {
-    if (incomingMessage.equalsIgnoreCase("enable_flap")) {
-      enableFlap();
-    } else if (incomingMessage.equalsIgnoreCase("disable_flap")) {
-      disableFlap();
-    } else if (incomingMessage.equalsIgnoreCase("snapshot")) {
+    if (incomingMessage.equalsIgnoreCase("snapshot")) {
       captureAndSendImage();
     } else if (incomingMessage.equalsIgnoreCase("restart")) {
       ESP.restart();
-    } else if (incomingMessage.equalsIgnoreCase("set_home") || incomingMessage.equalsIgnoreCase("set_away")) {
-      handleCatLocationCommand(incomingMessage);
     }
   } else if (String(topic) == "catflap/frame_size/set") {
     handleFrameSizeCommand(incomingMessage);
@@ -402,17 +468,18 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
     handleAWBCommand(incomingMessage);
   } else if (String(topic) == "catflap/special_effect/set") {
     handleSpecialEffectCommand(incomingMessage);
-  } else if (String(topic) == DETECTION_MODE_SET_TOPIC) {
-  handleDetectionModeCommand(incomingMessage);
-  } else if (String(topic) == DEBUG_TOGGLE_SET_TOPIC) {
+  } else if (String(topic) == SET_DETECTION_MODE_TOPIC) {
+    handleDetectionModeCommand(incomingMessage);
+  } else if (String(topic) == SET_FLAP_STATE_TOPIC) {
+    handleFlapStateCommand(incomingMessage);
+  } else if (String(topic) == SET_DEBUG_TOGGLE_TOPIC) {
     handleDebugToggleCommand(incomingMessage);
-  }
-  else if (String(topic) == COOLDOWN_SET_TOPIC) {
+  } else if (String(topic) == SET_COOLDOWN_TOPIC) {
     handleCooldownCommand(incomingMessage);
     lastSettingsChangeTime = millis();  // Update settings change timer
+  } else if (String(topic) == SET_CAT_LOCATION_TOPIC) {
+    handleCatLocationCommand(incomingMessage);
   }
-
-  // Add handling for other settings
 }
 
 void mqttDebugPrint(const char* message) {
@@ -460,152 +527,105 @@ void publishDiscoveryConfigs() {
   // IR Barrier Binary Sensor
   String irSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/binary_sensor/" + DEVICE_NAME + "/ir_barrier/config";
   DynamicJsonDocument irSensorConfig(capacity);
-  irSensorConfig["name"] = "Cat Flap IR Barrier";
+  irSensorConfig["name"] = "IR Barrier";
   irSensorConfig["state_topic"] = IR_BARRIER_TOPIC;
   irSensorConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_ir_barrier";
   irSensorConfig["device_class"] = "motion";
-  irSensorConfig["payload_on"] = "closed";
-  irSensorConfig["payload_off"] = "open";
-  JsonObject deviceInfo1 = irSensorConfig.createNestedObject("device");
-  deviceInfo1["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfo1["name"] = "Cat Flap";
-  deviceInfo1["model"] = "AI Cat Flap";
-  deviceInfo1["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
+  irSensorConfig["payload_on"] = "broken";
+  irSensorConfig["payload_off"] = "clear";
+  JsonObject deviceInfo = irSensorConfig.createNestedObject("device");
+  deviceInfo["identifiers"] = DEVICE_UNIQUE_ID;
+  deviceInfo["name"] = "Cat Flap";
+  deviceInfo["model"] = "AI Cat Flap";
+  deviceInfo["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
+  deviceInfo["configuration_url"] = "http://192.168.1.163:5000/classify";
   String irSensorConfigPayload;
   serializeJson(irSensorConfig, irSensorConfigPayload);
-  //mqttDebugPrintf("Payload size for %s: %d bytes\n", irSensorConfigTopic.c_str(), irSensorConfigPayload.length());
-  //mqttDebugPrintf("Free heap before publishing to %s: %d bytes\n", irSensorConfigTopic.c_str(), ESP.getFreeHeap());
-
-  if (client.publish(irSensorConfigTopic.c_str(), irSensorConfigPayload.c_str(), true))
-  {
-    //mqttDebugPrintln("irSensorConfigTopic - Sent");
-  } else {
-    mqttDebugPrintln("irSensorConfigTopic - Failed");
-  }
+  client.publish(irSensorConfigTopic.c_str(), irSensorConfigPayload.c_str(), true);
 
   // Flap State Sensor
-  String flapStateConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/flap_state/config";
+  String flapStateConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/binary_sensor/" + DEVICE_NAME + "/flap_state/config";
   DynamicJsonDocument flapStateConfig(capacity);
   flapStateConfig["name"] = "Cat Flap State";
   flapStateConfig["state_topic"] = FLAP_STATE_TOPIC;
+  flapStateConfig["device_class"] = "door";
   flapStateConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_flap_state";
   JsonObject deviceInfo2 = flapStateConfig.createNestedObject("device");
   deviceInfo2["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfo2["name"] = "Cat Flap";
-  deviceInfo2["model"] = "AI Cat Flap";
-  deviceInfo2["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String flapStateConfigPayload;
   serializeJson(flapStateConfig, flapStateConfigPayload);
-  //mqttDebugPrintf("Payload size for %s: %d bytes\n", flapStateConfigTopic.c_str(), flapStateConfigPayload.length());
-  if (client.publish(flapStateConfigTopic.c_str(), flapStateConfigPayload.c_str(), true))
-  {
-    //mqttDebugPrintln("flapStateConfigTopic - Sent");
-  } else {
-    mqttDebugPrintln("flapStateConfigTopic - Failed");
-  }
+  client.publish(flapStateConfigTopic.c_str(), flapStateConfigPayload.c_str(), true);
 
   // Flap Control Switch
   String flapSwitchConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/control/config";
   DynamicJsonDocument flapSwitchConfig(capacity);
-  flapSwitchConfig["name"] = "Cat Flap Control";
-  flapSwitchConfig["command_topic"] = COMMAND_TOPIC;
-  flapSwitchConfig["payload_on"] = "enable_flap";
-  flapSwitchConfig["payload_off"] = "disable_flap";
-  flapSwitchConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_control";
+  flapSwitchConfig["name"] = "Enable Cat Flap";
+  flapSwitchConfig["command_topic"] = SET_FLAP_STATE_TOPIC;
+  flapSwitchConfig["state_topic"] = FLAP_STATE_TOPIC;
+  flapSwitchConfig["payload_on"] = "ON";
+  flapSwitchConfig["payload_off"] = "OFF";
+  flapSwitchConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_flap_control";
   JsonObject deviceInfo3 = flapSwitchConfig.createNestedObject("device");
   deviceInfo3["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfo3["name"] = "Cat Flap";
-  deviceInfo3["model"] = "AI Cat Flap";
-  deviceInfo3["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String flapSwitchConfigPayload;
   serializeJson(flapSwitchConfig, flapSwitchConfigPayload);
-  //mqttDebugPrintf("Payload size for %s: %d bytes\n", flapSwitchConfigTopic.c_str(), flapSwitchConfigPayload.length());
-  if (client.publish(flapSwitchConfigTopic.c_str(), flapSwitchConfigPayload.c_str(), true))
-  {
-    //mqttDebugPrintln("flapSwitchConfigTopic - Sent");
-  } else {
-    mqttDebugPrintln("flapSwitchConfigTopic - Failed");
-  }
+  client.publish(flapSwitchConfigTopic.c_str(), flapSwitchConfigPayload.c_str(), true);
 
   // Detection Mode Switch
   String detectionModeConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/detection_mode/config";
   DynamicJsonDocument detectionModeConfig(capacity);
   detectionModeConfig["name"] = "Detection Mode";
-  detectionModeConfig["command_topic"] = DETECTION_MODE_SET_TOPIC;
+  detectionModeConfig["command_topic"] = SET_DETECTION_MODE_TOPIC;
   detectionModeConfig["state_topic"] = DETECTION_MODE_TOPIC;
   detectionModeConfig["payload_on"] = "ON";
   detectionModeConfig["payload_off"] = "OFF";
   detectionModeConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_detection_mode";
   JsonObject deviceInfoDetection = detectionModeConfig.createNestedObject("device");
   deviceInfoDetection["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoDetection["name"] = "Cat Flap";
-  deviceInfoDetection["model"] = "AI Cat Flap";
-  deviceInfoDetection["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String detectionModeConfigPayload;
   serializeJson(detectionModeConfig, detectionModeConfigPayload);
   client.publish(detectionModeConfigTopic.c_str(), detectionModeConfigPayload.c_str(), true);
 
   // Cat Location Sensor
-  String catLocationConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/cat_location/config";
+  String catLocationConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/binary_sensor/" + DEVICE_NAME + "/cat_location/config";
   DynamicJsonDocument catLocationConfig(capacity);
   catLocationConfig["name"] = "Cat Location";
   catLocationConfig["state_topic"] = CAT_LOCATION_TOPIC;
   catLocationConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_cat_location";
+  catLocationConfig["device_class"] = "presence";
   JsonObject deviceInfoCatLocation = catLocationConfig.createNestedObject("device");
   deviceInfoCatLocation["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoCatLocation["name"] = "Cat Flap";
-  deviceInfoCatLocation["model"] = "AI Cat Flap";
-  deviceInfoCatLocation["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String catLocationConfigPayload;
   serializeJson(catLocationConfig, catLocationConfigPayload);
   client.publish(catLocationConfigTopic.c_str(), catLocationConfigPayload.c_str(), true);
 
-  // Set Home Button
-  String setHomeButtonConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/button/" + DEVICE_NAME + "/set_home/config";
-  DynamicJsonDocument setHomeButtonConfig(capacity);
-  setHomeButtonConfig["name"] = "Set Cat Location Home";
-  setHomeButtonConfig["command_topic"] = COMMAND_TOPIC;
-  setHomeButtonConfig["payload_press"] = "set_home";
-  setHomeButtonConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_set_home";
-  JsonObject deviceInfoSetHome = setHomeButtonConfig.createNestedObject("device");
+  // Set Home Switch
+  String setHomeSwitchConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/set_home/config";
+  DynamicJsonDocument setHomeSwitchConfig(capacity);
+  setHomeSwitchConfig["name"] = "Cat Home";
+  setHomeSwitchConfig["command_topic"] = SET_CAT_LOCATION_TOPIC;
+  setHomeSwitchConfig["state_topic"] = CAT_LOCATION_TOPIC;
+  setHomeSwitchConfig["payload_on"] = "ON";
+  setHomeSwitchConfig["payload_off"] = "OFF";
+  setHomeSwitchConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_set_home";
+  JsonObject deviceInfoSetHome = setHomeSwitchConfig.createNestedObject("device");
   deviceInfoSetHome["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoSetHome["name"] = "Cat Flap";
-  deviceInfoSetHome["model"] = "AI Cat Flap";
-  deviceInfoSetHome["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
-  String setHomeButtonConfigPayload;
-  serializeJson(setHomeButtonConfig, setHomeButtonConfigPayload);
-  client.publish(setHomeButtonConfigTopic.c_str(), setHomeButtonConfigPayload.c_str(), true);
-
-  // Set Away Button
-  String setAwayButtonConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/button/" + DEVICE_NAME + "/set_away/config";
-  DynamicJsonDocument setAwayButtonConfig(capacity);
-  setAwayButtonConfig["name"] = "Set Cat Location Away";
-  setAwayButtonConfig["command_topic"] = COMMAND_TOPIC;
-  setAwayButtonConfig["payload_press"] = "set_away";
-  setAwayButtonConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_set_away";
-  JsonObject deviceInfoSetAway = setAwayButtonConfig.createNestedObject("device");
-  deviceInfoSetAway["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoSetAway["name"] = "Cat Flap";
-  deviceInfoSetAway["model"] = "AI Cat Flap";
-  deviceInfoSetAway["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
-  String setAwayButtonConfigPayload;
-  serializeJson(setAwayButtonConfig, setAwayButtonConfigPayload);
-  client.publish(setAwayButtonConfigTopic.c_str(), setAwayButtonConfigPayload.c_str(), true);
+  String setHomeSwitchConfigPayload;
+  serializeJson(setHomeSwitchConfig, setHomeSwitchConfigPayload);
+  client.publish(setHomeSwitchConfigTopic.c_str(), setHomeSwitchConfigPayload.c_str(), true);
 
   // Debug Toggle Switch
   String debugToggleConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/debug_toggle/config";
   DynamicJsonDocument debugToggleConfig(capacity);
   debugToggleConfig["name"] = "Debug Output";
-  debugToggleConfig["command_topic"] = DEBUG_TOGGLE_SET_TOPIC;
+  debugToggleConfig["command_topic"] = SET_DEBUG_TOGGLE_TOPIC;
   debugToggleConfig["state_topic"] = DEBUG_TOGGLE_TOPIC;
   debugToggleConfig["payload_on"] = "ON";
   debugToggleConfig["payload_off"] = "OFF";
   debugToggleConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_debug_toggle";
+  debugToggleConfig["entity_category"] = "diagnostic";
   JsonObject deviceInfoDebugToggle = debugToggleConfig.createNestedObject("device");
   deviceInfoDebugToggle["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoDebugToggle["name"] = "Cat Flap";
-  deviceInfoDebugToggle["model"] = "AI Cat Flap";
-  deviceInfoDebugToggle["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String debugToggleConfigPayload;
   serializeJson(debugToggleConfig, debugToggleConfigPayload);
   client.publish(debugToggleConfigTopic.c_str(), debugToggleConfigPayload.c_str(), true);
@@ -613,30 +633,22 @@ void publishDiscoveryConfigs() {
    // Camera Entity
   String cameraConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/camera/" + DEVICE_NAME + "/camera/config";
   DynamicJsonDocument cameraConfig(capacity);
-  cameraConfig["name"] = "Cat Flap Camera";
+  cameraConfig["name"] = "Last Image";
   cameraConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_camera";
   cameraConfig["topic"] = IMAGE_TOPIC;
   cameraConfig["image_encoding"] = "b64";  // Specify the image encoding as Base64
   JsonObject deviceInfo4 = cameraConfig.createNestedObject("device");
   deviceInfo4["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfo4["name"] = "Cat Flap";
-  deviceInfo4["model"] = "AI Cat Flap";
-  deviceInfo4["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String cameraConfigPayload;
   serializeJson(cameraConfig, cameraConfigPayload);
-  //mqttDebugPrintf("Payload size for %s: %d bytes\n", cameraConfigTopic.c_str(), cameraConfigPayload.length());
-  if (client.publish(cameraConfigTopic.c_str(), cameraConfigPayload.c_str(), true))
-  {
-    //mqttDebugPrintln("cameraConfigTopic - Sent");
-  } else {
-    mqttDebugPrintln("cameraConfigTopic - Failed");
-  }
+  client.publish(cameraConfigTopic.c_str(), cameraConfigPayload.c_str(), true);
 
   // Frame Size Select
   String frameSizeConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/select/" + DEVICE_NAME + "/frame_size/config";
   DynamicJsonDocument frameSizeConfig(capacity);
-  frameSizeConfig["name"] = "Cat Flap Camera Frame Size";
+  frameSizeConfig["name"] = "Camera Frame Size";
   frameSizeConfig["command_topic"] = "catflap/frame_size/set";
+  //frameSizeConfig["entity_category"] = "configuration";
   frameSizeConfig["state_topic"] = "catflap/frame_size";
   frameSizeConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_frame_size";
   JsonArray frameSizeOptions = frameSizeConfig.createNestedArray("options");
@@ -647,9 +659,6 @@ void publishDiscoveryConfigs() {
   // Add other frame sizes as needed
   JsonObject deviceInfoFrameSize = frameSizeConfig.createNestedObject("device");
   deviceInfoFrameSize["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoFrameSize["name"] = "Cat Flap";
-  deviceInfoFrameSize["model"] = "AI Cat Flap";
-  deviceInfoFrameSize["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String frameSizeConfigPayload;
   serializeJson(frameSizeConfig, frameSizeConfigPayload);
   client.publish(frameSizeConfigTopic.c_str(), frameSizeConfigPayload.c_str(), true);
@@ -657,8 +666,9 @@ void publishDiscoveryConfigs() {
   // JPEG Quality Number
   String jpegQualityConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/jpeg_quality/config";
   DynamicJsonDocument jpegQualityConfig(capacity);
-  jpegQualityConfig["name"] = "Cat Flap Camera JPEG Quality";
+  jpegQualityConfig["name"] = "Camera JPEG Quality";
   jpegQualityConfig["command_topic"] = "catflap/jpeg_quality/set";
+  //jpegQualityConfig["entity_category"] = "configuration";
   jpegQualityConfig["state_topic"] = "catflap/jpeg_quality";
   jpegQualityConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_jpeg_quality";
   jpegQualityConfig["min"] = 10;
@@ -666,9 +676,6 @@ void publishDiscoveryConfigs() {
   jpegQualityConfig["step"] = 1;
   JsonObject deviceInfoJpegQuality = jpegQualityConfig.createNestedObject("device");
   deviceInfoJpegQuality["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoJpegQuality["name"] = "Cat Flap";
-  deviceInfoJpegQuality["model"] = "AI Cat Flap";
-  deviceInfoJpegQuality["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String jpegQualityConfigPayload;
   serializeJson(jpegQualityConfig, jpegQualityConfigPayload);
   client.publish(jpegQualityConfigTopic.c_str(), jpegQualityConfigPayload.c_str(), true);
@@ -676,8 +683,9 @@ void publishDiscoveryConfigs() {
   // Brightness Number
   String brightnessConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/brightness/config";
   DynamicJsonDocument brightnessConfig(capacity);
-  brightnessConfig["name"] = "Cat Flap Camera Brightness";
+  brightnessConfig["name"] = "Camera Brightness";
   brightnessConfig["command_topic"] = "catflap/brightness/set";
+  //brightnessConfig["entity_category"] = "configuration";
   brightnessConfig["state_topic"] = "catflap/brightness";
   brightnessConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_brightness";
   brightnessConfig["min"] = -2;
@@ -685,9 +693,6 @@ void publishDiscoveryConfigs() {
   brightnessConfig["step"] = 1;
   JsonObject deviceInfoBrightness = brightnessConfig.createNestedObject("device");
   deviceInfoBrightness["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoBrightness["name"] = "Cat Flap";
-  deviceInfoBrightness["model"] = "AI Cat Flap";
-  deviceInfoBrightness["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String brightnessConfigPayload;
   serializeJson(brightnessConfig, brightnessConfigPayload);
   client.publish(brightnessConfigTopic.c_str(), brightnessConfigPayload.c_str(), true);
@@ -695,8 +700,9 @@ void publishDiscoveryConfigs() {
   // Contrast Number
   String contrastConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/contrast/config";
   DynamicJsonDocument contrastConfig(capacity);
-  contrastConfig["name"] = "Cat Flap Camera Contrast";
+  contrastConfig["name"] = "Camera Contrast";
   contrastConfig["command_topic"] = "catflap/contrast/set";
+  //contrastConfig["entity_category"] = "configuration";
   contrastConfig["state_topic"] = "catflap/contrast";
   contrastConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_contrast";
   contrastConfig["min"] = -2;
@@ -704,9 +710,6 @@ void publishDiscoveryConfigs() {
   contrastConfig["step"] = 1;
   JsonObject deviceInfoContrast = contrastConfig.createNestedObject("device");
   deviceInfoContrast["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoContrast["name"] = "Cat Flap";
-  deviceInfoContrast["model"] = "AI Cat Flap";
-  deviceInfoContrast["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String contrastConfigPayload;
   serializeJson(contrastConfig, contrastConfigPayload);
   client.publish(contrastConfigTopic.c_str(), contrastConfigPayload.c_str(), true);
@@ -714,8 +717,9 @@ void publishDiscoveryConfigs() {
   // Saturation Number
   String saturationConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/saturation/config";
   DynamicJsonDocument saturationConfig(capacity);
-  saturationConfig["name"] = "Cat Flap Camera Saturation";
+  saturationConfig["name"] = "Camera Saturation";
   saturationConfig["command_topic"] = "catflap/saturation/set";
+  //saturationConfig["entity_category"] = "configuration";
   saturationConfig["state_topic"] = "catflap/saturation";
   saturationConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_saturation";
   saturationConfig["min"] = -2;
@@ -723,9 +727,6 @@ void publishDiscoveryConfigs() {
   saturationConfig["step"] = 1;
   JsonObject deviceInfoSaturation = saturationConfig.createNestedObject("device");
   deviceInfoSaturation["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoSaturation["name"] = "Cat Flap";
-  deviceInfoSaturation["model"] = "AI Cat Flap";
-  deviceInfoSaturation["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String saturationConfigPayload;
   serializeJson(saturationConfig, saturationConfigPayload);
   client.publish(saturationConfigTopic.c_str(), saturationConfigPayload.c_str(), true);
@@ -733,17 +734,15 @@ void publishDiscoveryConfigs() {
   // AWB Switch
   String awbConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/awb/config";
   DynamicJsonDocument awbConfig(capacity);
-  awbConfig["name"] = "Cat Flap Camera AWB";
+  awbConfig["name"] = "Camera AWB";
   awbConfig["command_topic"] = "catflap/awb/set";
+  //awbConfig["entity_category"] = "configuration";
   awbConfig["state_topic"] = "catflap/awb";
   awbConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_awb";
   awbConfig["payload_on"] = "ON";
   awbConfig["payload_off"] = "OFF";
   JsonObject deviceInfoAWB = awbConfig.createNestedObject("device");
   deviceInfoAWB["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoAWB["name"] = "Cat Flap";
-  deviceInfoAWB["model"] = "AI Cat Flap";
-  deviceInfoAWB["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String awbConfigPayload;
   serializeJson(awbConfig, awbConfigPayload);
   client.publish(awbConfigTopic.c_str(), awbConfigPayload.c_str(), true);
@@ -751,8 +750,9 @@ void publishDiscoveryConfigs() {
   // Special Effect Select
   String specialEffectConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/select/" + DEVICE_NAME + "/special_effect/config";
   DynamicJsonDocument specialEffectConfig(capacity);
-  specialEffectConfig["name"] = "Cat Flap Camera Special Effect";
+  specialEffectConfig["name"] = "Camera Special Effect";
   specialEffectConfig["command_topic"] = "catflap/special_effect/set";
+  //specialEffectConfig["entity_category"] = "configuration";
   specialEffectConfig["state_topic"] = "catflap/special_effect";
   specialEffectConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_special_effect";
   JsonArray effectOptions = specialEffectConfig.createNestedArray("options");
@@ -766,9 +766,6 @@ void publishDiscoveryConfigs() {
   // Add other effects as needed
   JsonObject deviceInfoEffect = specialEffectConfig.createNestedObject("device");
   deviceInfoEffect["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoEffect["name"] = "Cat Flap";
-  deviceInfoEffect["model"] = "AI Cat Flap";
-  deviceInfoEffect["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String specialEffectConfigPayload;
   serializeJson(specialEffectConfig, specialEffectConfigPayload);
   client.publish(specialEffectConfigTopic.c_str(), specialEffectConfigPayload.c_str(), true);
@@ -776,15 +773,13 @@ void publishDiscoveryConfigs() {
   // Snapshot Button
   String snapshotButtonConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/button/" + DEVICE_NAME + "/snapshot/config";
   DynamicJsonDocument snapshotButtonConfig(capacity);
-  snapshotButtonConfig["name"] = "Cat Flap Camera Snapshot";
+  snapshotButtonConfig["name"] = "Camera Snapshot";
   snapshotButtonConfig["command_topic"] = COMMAND_TOPIC;
   snapshotButtonConfig["payload_press"] = "snapshot";
+  snapshotButtonConfig["icon"] = "mdi:camera-iris";
   snapshotButtonConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_snapshot";
   JsonObject deviceInfoSnapshot = snapshotButtonConfig.createNestedObject("device");
   deviceInfoSnapshot["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoSnapshot["name"] = "Cat Flap";
-  deviceInfoSnapshot["model"] = "AI Cat Flap";
-  deviceInfoSnapshot["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String snapshotButtonConfigPayload;
   serializeJson(snapshotButtonConfig, snapshotButtonConfigPayload);
   client.publish(snapshotButtonConfigTopic.c_str(), snapshotButtonConfigPayload.c_str(), true);
@@ -792,15 +787,13 @@ void publishDiscoveryConfigs() {
   // Restart Button
   String restartButtonConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/button/" + DEVICE_NAME + "/restart/config";
   DynamicJsonDocument restartButtonConfig(capacity);
-  restartButtonConfig["name"] = "Cat Flap Camera Restart";
+  restartButtonConfig["name"] = "Cat Flap Restart";
   restartButtonConfig["command_topic"] = COMMAND_TOPIC;
   restartButtonConfig["payload_press"] = "restart";
+  restartButtonConfig["icon"] = "mdi:restart";
   restartButtonConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_restart";
   JsonObject deviceInfoRestart = restartButtonConfig.createNestedObject("device");
   deviceInfoRestart["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoRestart["name"] = "Cat Flap";
-  deviceInfoRestart["model"] = "AI Cat Flap";
-  deviceInfoRestart["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String restartButtonConfigPayload;
   serializeJson(restartButtonConfig, restartButtonConfigPayload);
   client.publish(restartButtonConfigTopic.c_str(), restartButtonConfigPayload.c_str(), true);
@@ -808,17 +801,13 @@ void publishDiscoveryConfigs() {
   // Debug Sensor
   String debugSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/debug/config";
   DynamicJsonDocument debugSensorConfig(512);
-  debugSensorConfig["name"] = "Cat Flap Debug";
+  debugSensorConfig["name"] = "Debug Output";
   debugSensorConfig["state_topic"] = DEBUG_TOPIC;
   debugSensorConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_debug";
   debugSensorConfig["icon"] = "mdi:message-text";
-  // Optionally set the device class if appropriate
-  // debugSensorConfig["device_class"] = "timestamp";  // Use if messages are timestamps
+  debugSensorConfig["entity_category"] = "diagnostic";
   JsonObject deviceInfoDebug = debugSensorConfig.createNestedObject("device");
   deviceInfoDebug["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoDebug["name"] = "Cat Flap";
-  deviceInfoDebug["model"] = "AI Cat Flap";
-  deviceInfoDebug["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String debugSensorConfigPayload;
   serializeJson(debugSensorConfig, debugSensorConfigPayload);
   client.publish(debugSensorConfigTopic.c_str(), debugSensorConfigPayload.c_str(), true);
@@ -826,15 +815,12 @@ void publishDiscoveryConfigs() {
   // Alert Sensor
   String alertSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/alert/config";
   DynamicJsonDocument alertSensorConfig(512);
-  alertSensorConfig["name"] = "Cat Flap Alert";
+  alertSensorConfig["name"] = "Alert Output";
   alertSensorConfig["state_topic"] = ALERT_TOPIC;
   alertSensorConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_alert";
   alertSensorConfig["icon"] = "mdi:message-text";
   JsonObject deviceInfoAlert = alertSensorConfig.createNestedObject("device");
   deviceInfoAlert["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoAlert["name"] = "Cat Flap";
-  deviceInfoAlert["model"] = "AI Cat Flap";
-  deviceInfoAlert["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String alertSensorConfigPayload;
   serializeJson(alertSensorConfig, alertSensorConfigPayload);
   client.publish(alertSensorConfigTopic.c_str(), alertSensorConfigPayload.c_str(), true);
@@ -843,7 +829,8 @@ void publishDiscoveryConfigs() {
   String cooldownConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/cooldown/config";
   DynamicJsonDocument cooldownConfig(512);
   cooldownConfig["name"] = "IR Barrier Cooldown";
-  cooldownConfig["command_topic"] = COOLDOWN_SET_TOPIC;
+  cooldownConfig["command_topic"] = SET_COOLDOWN_TOPIC;
+  //cooldownConfig["entity_category"] = "configuration";
   cooldownConfig["state_topic"] = COOLDOWN_STATE_TOPIC;
   cooldownConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_cooldown";
   cooldownConfig["min"] = 0.0;
@@ -852,13 +839,41 @@ void publishDiscoveryConfigs() {
   cooldownConfig["unit_of_measurement"] = "s";
   JsonObject deviceInfoCooldown = cooldownConfig.createNestedObject("device");
   deviceInfoCooldown["identifiers"] = DEVICE_UNIQUE_ID;
-  deviceInfoCooldown["name"] = "Cat Flap";
-  deviceInfoCooldown["model"] = "AI Cat Flap";
-  deviceInfoCooldown["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
   String cooldownConfigPayload;
   serializeJson(cooldownConfig, cooldownConfigPayload);
   client.publish(cooldownConfigTopic.c_str(), cooldownConfigPayload.c_str(), true);
 
+  // Wifi signal Sensor
+  String wifiSignalSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/wifi_signal/config";
+  DynamicJsonDocument wifiSignalSensorConfig(512);
+  wifiSignalSensorConfig["name"] = "WiFi Signal";
+  wifiSignalSensorConfig["state_topic"] = WIFI_SIGNAL_TOPIC;
+  wifiSignalSensorConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_wifi_signal";
+  wifiSignalSensorConfig["unit_of_measurement"] = "dBm";
+  wifiSignalSensorConfig["entity_category"] = "diagnostic";
+  wifiSignalSensorConfig["device_class"] = "signal_strength";
+  wifiSignalSensorConfig["state_class"] = "measurement";
+  JsonObject deviceInfoWifiSignal = wifiSignalSensorConfig.createNestedObject("device");
+  deviceInfoWifiSignal["identifiers"] = DEVICE_UNIQUE_ID;
+  String wifiSignalSensorConfigPayload;
+  serializeJson(wifiSignalSensorConfig, wifiSignalSensorConfigPayload);
+  client.publish(wifiSignalSensorConfigTopic.c_str(), wifiSignalSensorConfigPayload.c_str(), true);
+
+  // IP Sensor
+  String ipSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/ip/config";
+  DynamicJsonDocument ipSensorConfig(512);
+  ipSensorConfig["name"] = "IP Address";
+  ipSensorConfig["state_topic"] = IP_TOPIC;
+  ipSensorConfig["icon"] = "mdi:ip-network";
+  ipSensorConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_ip";
+  ipSensorConfig["entity_category"] = "diagnostic";
+  JsonObject deviceInfoIP = ipSensorConfig.createNestedObject("device");
+  deviceInfoIP["identifiers"] = DEVICE_UNIQUE_ID;
+  String ipSensorConfigPayload;
+  serializeJson(ipSensorConfig, ipSensorConfigPayload);
+  client.publish(ipSensorConfigTopic.c_str(), ipSensorConfigPayload.c_str(), true);
+
+  // TODO: Add free heap
 }
 
 void handleDetectionModeCommand(String stateStr) {
@@ -869,6 +884,15 @@ void handleDetectionModeCommand(String stateStr) {
   lastSettingsChangeTime = millis();
 }
 
+void handleFlapStateCommand(String stateStr) {
+  bool setFlapEnabled = stateStr.equalsIgnoreCase("ON");
+  if (setFlapEnabled){
+    enableFlap();
+  } else {
+    disableFlap();
+  }
+}
+
 void handleDebugToggleCommand(String stateStr) {
   mqttDebugEnabled = stateStr.equalsIgnoreCase("ON");
   client.publish(DEBUG_TOGGLE_TOPIC, mqttDebugEnabled ? "ON" : "OFF", true);
@@ -876,12 +900,8 @@ void handleDebugToggleCommand(String stateStr) {
 }
 
 void handleCatLocationCommand(String locationStr) {
-  if (locationStr.equalsIgnoreCase("set_home")) {
-    catLocation = "Home";
-  } else if (locationStr.equalsIgnoreCase("set_away")) {
-    catLocation = "Away";
-  }
-  client.publish(CAT_LOCATION_TOPIC, catLocation.c_str(), true);
+  catLocation = locationStr.equalsIgnoreCase("ON");
+  client.publish(CAT_LOCATION_TOPIC, catLocation ? "ON" : "OFF", true);
   mqttDebugPrintln("Cat location updated");
 }
 
@@ -1042,17 +1062,14 @@ void handleCooldownCommand(String cooldownStr) {
 }
 
 void handleIRBarrierStateChange(bool barrierBroken) {
+  unsigned long currentTime = millis();
   if (barrierBroken) {
-    unsigned long currentTime = millis();
     if (currentTime - lastTriggerTime >= (cooldownDuration * 1000)) {
-      lastTriggerTime = currentTime;
-      mqttDebugPrintln("IR Barrier Triggered");
-
       // Update the last IR state
       lastIRState = LOW;  // Barrier is broken
 
       // Publish IR barrier state
-      client.publish(IR_BARRIER_TOPIC, "closed", true);
+      client.publish(IR_BARRIER_TOPIC, "broken", true);
 
       // If detection mode is enabled
       if (detectionModeEnabled) {
@@ -1062,14 +1079,14 @@ void handleIRBarrierStateChange(bool barrierBroken) {
       mqttDebugPrintln("Trigger ignored due to cooldown");
     }
   } else {
-    // Barrier is not broken
-    mqttDebugPrintln("IR Barrier is open");
+    // Update on falling edge
+    lastTriggerTime = currentTime;
 
     // Update the last IR state
     lastIRState = HIGH;
 
     // Publish IR barrier state
-    client.publish(IR_BARRIER_TOPIC, "open", true);
+    client.publish(IR_BARRIER_TOPIC, "clear", true);
   }
 }
 
@@ -1124,6 +1141,19 @@ void publishCameraSettings() {
 
     // Publish other settings as needed
   }
+}
+
+void publishWifiSignalState() {
+  if (millis() > (lastWifiUpdateTime + WIFI_UPDATE_INTERVAL)){
+    lastWifiUpdateTime = millis();
+    String wifiSignalStr = String(WiFi.RSSI());
+    client.publish(WIFI_SIGNAL_TOPIC, wifiSignalStr.c_str(), true);
+  }
+}
+
+void publishIPState() {
+  String ipAddress = WiFi.localIP().toString();
+  client.publish(IP_TOPIC, ipAddress.c_str(), true);
 }
 
 void publishCooldownState() {
