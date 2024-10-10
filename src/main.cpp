@@ -31,6 +31,7 @@ const char* password = WIFI_PASSWORD;
 #define SET_COOLDOWN_TOPIC "catflap/cooldown/set"
 #define SET_CAT_LOCATION_TOPIC "catflap/cat_location/set"
 #define SET_FLAP_STATE_TOPIC "catflap/flap_state/set"
+#define INFERENCE_TOPIC "catflap/inference"
 
 // Device information
 #define DEVICE_NAME "catflap"
@@ -74,6 +75,8 @@ void checkResetReason();
 void setup_wifi();
 void mqttConnect();
 void mqttReconnect();
+void mqttSubscribe();
+void mqttInitialPublish();
 void initCamera();
 void captureAndSendImage();
 void enableFlap();
@@ -87,6 +90,7 @@ void publishIPState();
 void mqttDebugPrint(const char* message);
 void mqttDebugPrintln(const char* message);
 void mqttDebugPrintf(const char* format, ...);
+void handleInferenceTopic(String inferenceStr);
 void handleFrameSizeCommand(String frameSizeStr);
 void handleJpegQualityCommand(String qualityStr);
 void publishCameraSettings();
@@ -282,41 +286,8 @@ void mqttConnect() {
     Serial.print("Attempting MQTT connection...");
     if (client.connect(clientId.c_str())) {
       Serial.println("connected");
-      // Subscribe to command topics
-      client.subscribe(COMMAND_TOPIC);
-      client.subscribe("catflap/frame_size/set");
-      client.subscribe("catflap/jpeg_quality/set");
-      client.subscribe("catflap/brightness/set");
-      client.subscribe("catflap/contrast/set");
-      client.subscribe("catflap/saturation/set");
-      client.subscribe("catflap/awb/set");
-      client.subscribe("catflap/special_effect/set");
-      client.subscribe(SET_DETECTION_MODE_TOPIC);
-      client.subscribe(SET_FLAP_STATE_TOPIC);
-      client.subscribe(SET_DEBUG_TOGGLE_TOPIC);
-      client.subscribe(SET_CAT_LOCATION_TOPIC);
-      client.subscribe(SET_COOLDOWN_TOPIC);
-
-      // Add subscriptions for other settings
-      //mqttDebugPrintf("MQTT buffer size set to: %d bytes\n", client.getBufferSize());
-
-      // Publish discovery configs
-      publishDiscoveryConfigs();
-
-      // Publish current camera settings
-      publishCameraSettings();
-
-      publishCooldownState();
-
-      // Publish detection mode state
-      client.publish(DETECTION_MODE_TOPIC, detectionModeEnabled ? "ON" : "OFF", true);
-
-      // Publish debug toggle state
-      client.publish(DEBUG_TOGGLE_TOPIC, mqttDebugEnabled ? "ON" : "OFF", true);
-
-      // Publish cat location
-      client.publish(CAT_LOCATION_TOPIC, catLocation ? "ON" : "OFF", true);
-
+      mqttSubscribe();
+      mqttInitialPublish();
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -336,18 +307,7 @@ void mqttReconnect() {
     if (client.connect(clientId.c_str())) {
       Serial.println("connected");
       // Subscribe to command topics
-      client.subscribe(COMMAND_TOPIC);
-      client.subscribe("catflap/frame_size/set");
-      client.subscribe("catflap/jpeg_quality/set");
-      client.subscribe("catflap/brightness/set");
-      client.subscribe("catflap/contrast/set");
-      client.subscribe("catflap/saturation/set");
-      client.subscribe("catflap/awb/set");
-      client.subscribe("catflap/special_effect/set");
-      client.subscribe(SET_DETECTION_MODE_TOPIC);
-      client.subscribe(SET_DEBUG_TOGGLE_TOPIC);
-      client.subscribe(SET_COOLDOWN_TOPIC);
-
+      mqttSubscribe();
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -355,6 +315,30 @@ void mqttReconnect() {
       delay(5000);
     }
   }
+}
+
+void mqttSubscribe() {
+  client.subscribe(COMMAND_TOPIC);
+  client.subscribe("catflap/frame_size/set");
+  client.subscribe("catflap/jpeg_quality/set");
+  client.subscribe("catflap/brightness/set");
+  client.subscribe("catflap/contrast/set");
+  client.subscribe("catflap/saturation/set");
+  client.subscribe("catflap/awb/set");
+  client.subscribe("catflap/special_effect/set");
+  client.subscribe(SET_DETECTION_MODE_TOPIC);
+  client.subscribe(SET_DEBUG_TOGGLE_TOPIC);
+  client.subscribe(SET_COOLDOWN_TOPIC);
+  client.subscribe(INFERENCE_TOPIC);
+}
+
+void mqttInitialPublish() {
+  publishDiscoveryConfigs();
+  publishCameraSettings();
+  publishCooldownState();
+  client.publish(DETECTION_MODE_TOPIC, detectionModeEnabled ? "ON" : "OFF", true);
+  client.publish(DEBUG_TOGGLE_TOPIC, mqttDebugEnabled ? "ON" : "OFF", true);
+  client.publish(CAT_LOCATION_TOPIC, catLocation ? "ON" : "OFF", true);
 }
 
 void initCamera() {
@@ -476,7 +460,8 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
     handleDebugToggleCommand(incomingMessage);
   } else if (String(topic) == SET_COOLDOWN_TOPIC) {
     handleCooldownCommand(incomingMessage);
-    lastSettingsChangeTime = millis();  // Update settings change timer
+  } else if (String(topic) == INFERENCE_TOPIC) {
+    handleInferenceTopic(incomingMessage);
   } else if (String(topic) == SET_CAT_LOCATION_TOPIC) {
     handleCatLocationCommand(incomingMessage);
   }
@@ -876,6 +861,21 @@ void publishDiscoveryConfigs() {
   // TODO: Add free heap
 }
 
+void handleInferenceTopic(String inferenceStr) {
+  if (inferenceStr == "not_cat"){
+    /* code */
+  } else if (inferenceStr == "cat_morris_entering") {
+    handleCatLocationCommand("ON");
+    handleFlapStateCommand("ON");
+  } else if (inferenceStr == "cat_morris_leaving") {
+    handleCatLocationCommand("OFF");
+  } else if (inferenceStr == "unknow_cat_entering") {
+    /* code */
+  } else if (inferenceStr == "prey") {
+    handleFlapStateCommand("OFF");
+  }
+}
+
 void handleDetectionModeCommand(String stateStr) {
   bool newState = stateStr.equalsIgnoreCase("ON");
   detectionModeEnabled = newState;
@@ -1055,7 +1055,7 @@ void handleCooldownCommand(String cooldownStr) {
     mqttDebugPrintln("Invalid cooldown value");
     return;
   }
-  
+  lastSettingsChangeTime = millis();  // Update settings change timer
   cooldownDuration = newCooldown;
   mqttDebugPrintf("Cooldown duration updated to %.1f seconds\n", cooldownDuration);
   publishCooldownState();
