@@ -18,6 +18,9 @@ const char* password = WIFI_PASSWORD;
 #define DEBUG_TOPIC "catflap/debug"
 #define ALERT_TOPIC "catflap/alert"
 #define WIFI_SIGNAL_TOPIC "catflap/wifi_signal"
+#define FREE_HEAP_TOPIC "catflap/free_heap"
+#define FRAGMENTATION_TOPIC "catflap/fragmentation"
+#define LOOPTIME_TOPIC "catflap/looptime"
 #define IP_TOPIC "catflap/ip"
 #define IMAGE_TOPIC "catflap/image"
 #define IR_BARRIER_TOPIC "catflap/ir_barrier"
@@ -37,7 +40,7 @@ const char* password = WIFI_PASSWORD;
 #define DEVICE_NAME "catflap"
 #define DEVICE_UNIQUE_ID "catflap_esp32"
 #define MQTT_DISCOVERY_PREFIX "homeassistant"
-#define DEVICE_SW_VERSION "1.0.0" //Increment together with git commits
+#define DEVICE_SW_VERSION "1.0.1" //Increment together with git commits
 
 // EEPROM Addresses
 #define EEPROM_SIZE 64
@@ -86,8 +89,11 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length);
 void setupOTA();
 void publishDiscoveryConfigs();
 void publishCooldownState();
-void publishWifiSignalState();
+void publishDiagnostics();
 void publishIPState();
+void monitorHeap();
+void recordLoopTime();
+float getAndResetMeanLoopTime();
 void mqttDebugPrint(const char* message);
 void mqttDebugPrintln(const char* message);
 void mqttDebugPrintf(const char* format, ...);
@@ -130,8 +136,13 @@ unsigned long lastSettingsChangeTime = 0;
 const unsigned long SETTINGS_SAVE_DELAY = 15000; // 15 seconds
 
 // Timer for wifi signal update
-unsigned long lastWifiUpdateTime = 0;
-const unsigned long WIFI_UPDATE_INTERVAL = 15000; 
+unsigned long lastDiagnosticUpdateTime = 0;
+const unsigned long DIAGNOSTIC_UPDATE_INTERVAL = 15000; 
+
+// Variables for loop time measurement
+unsigned long loopStartTime = 0;
+unsigned long loopDurationSum = 0;
+unsigned long loopCount = 0;
 
 
 // Debounce and Cooldown Settings
@@ -176,6 +187,7 @@ void setup() {
 }
 
 void loop() {
+  recordLoopTime();
   // Reconnect to Wi-Fi if disconnected
   if (WiFi.status() != WL_CONNECTED) {
     setup_wifi();
@@ -198,8 +210,7 @@ void loop() {
     lastSettingsChangeTime = 0;  // Reset timer
   }
 
-  publishWifiSignalState();
-  
+  publishDiagnostics();
   delay(10);  // Small delay to prevent watchdog resets
 }
 
@@ -877,7 +888,51 @@ void publishDiscoveryConfigs() {
   serializeJson(ipSensorConfig, ipSensorConfigPayload);
   client.publish(ipSensorConfigTopic.c_str(), ipSensorConfigPayload.c_str(), true);
 
-  // TODO: Add free heap
+  // Free Heap Sensor
+  String freeHeapSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/free_heap/config";
+  DynamicJsonDocument freeHeapSensorConfig(512);
+  freeHeapSensorConfig["name"] = "Free Heap";
+  freeHeapSensorConfig["state_topic"] = FREE_HEAP_TOPIC;
+  freeHeapSensorConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_free_heap";
+  freeHeapSensorConfig["unit_of_measurement"] = "B";
+  freeHeapSensorConfig["entity_category"] = "diagnostic";
+  freeHeapSensorConfig["device_class"] = "data_size";
+  freeHeapSensorConfig["state_class"] = "measurement";
+  JsonObject deviceInfoFreeHeap = freeHeapSensorConfig.createNestedObject("device");
+  deviceInfoFreeHeap["identifiers"] = DEVICE_UNIQUE_ID;
+  String freeHeapSensorConfigPayload;
+  serializeJson(freeHeapSensorConfig, freeHeapSensorConfigPayload);
+  client.publish(freeHeapSensorConfigTopic.c_str(), freeHeapSensorConfigPayload.c_str(), true);
+
+    // Fragmentation Sensor
+  String fragmentationSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/fragmentation/config";
+  DynamicJsonDocument fragmentationSensorConfig(512);
+  fragmentationSensorConfig["name"] = "Fragmentation";
+  fragmentationSensorConfig["state_topic"] = FRAGMENTATION_TOPIC;
+  fragmentationSensorConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_fragmentation";
+  fragmentationSensorConfig["unit_of_measurement"] = "%";
+  fragmentationSensorConfig["entity_category"] = "diagnostic";
+  fragmentationSensorConfig["state_class"] = "measurement";
+  JsonObject deviceInfoFragmentation = fragmentationSensorConfig.createNestedObject("device");
+  deviceInfoFragmentation["identifiers"] = DEVICE_UNIQUE_ID;
+  String fragmentationSensorConfigPayload;
+  serializeJson(fragmentationSensorConfig, fragmentationSensorConfigPayload);
+  client.publish(fragmentationSensorConfigTopic.c_str(), fragmentationSensorConfigPayload.c_str(), true);
+
+  // Looptime Sensor
+  String looptimeSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/looptime/config";
+  DynamicJsonDocument looptimeSensorConfig(512);
+  looptimeSensorConfig["name"] = "Looptime";
+  looptimeSensorConfig["state_topic"] = LOOPTIME_TOPIC;
+  looptimeSensorConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_looptime";
+  looptimeSensorConfig["unit_of_measurement"] = "us";
+  looptimeSensorConfig["entity_category"] = "diagnostic";
+  looptimeSensorConfig["state_class"] = "measurement";
+  JsonObject deviceInfoLooptime = looptimeSensorConfig.createNestedObject("device");
+  deviceInfoLooptime["identifiers"] = DEVICE_UNIQUE_ID;
+  String looptimeSensorConfigPayload;
+  serializeJson(looptimeSensorConfig, looptimeSensorConfigPayload);
+  client.publish(looptimeSensorConfigTopic.c_str(), looptimeSensorConfigPayload.c_str(), true);
 }
 
 void handleInferenceTopic(String inferenceStr) {
@@ -1162,12 +1217,68 @@ void publishCameraSettings() {
   }
 }
 
-void publishWifiSignalState() {
-  if (millis() > (lastWifiUpdateTime + WIFI_UPDATE_INTERVAL)){
-    lastWifiUpdateTime = millis();
+void publishDiagnostics() {
+  if (millis() > (lastDiagnosticUpdateTime + DIAGNOSTIC_UPDATE_INTERVAL)){
+    lastDiagnosticUpdateTime = millis();
     String wifiSignalStr = String(WiFi.RSSI());
     client.publish(WIFI_SIGNAL_TOPIC, wifiSignalStr.c_str(), true);
+    String freeHeap = String(ESP.getFreeHeap());
+    client.publish(FREE_HEAP_TOPIC, freeHeap.c_str(), true);
+    monitorHeap();
+    String loopTime = String(getAndResetMeanLoopTime());
+    client.publish(LOOPTIME_TOPIC, loopTime.c_str(), true);
   }
+}
+
+
+
+void monitorHeap() {
+  multi_heap_info_t heap_info;
+  heap_caps_get_info(&heap_info, MALLOC_CAP_DEFAULT);
+
+  size_t freeHeap = heap_info.total_free_bytes;
+  size_t minFreeHeap = heap_info.minimum_free_bytes;
+  size_t largestFreeBlock = heap_info.largest_free_block;
+
+  // Calculate heap fragmentation as a percentage
+  uint8_t heapFragmentation = 0;
+  if (freeHeap > 0) {
+    heapFragmentation = (uint8_t)((freeHeap - largestFreeBlock) * 100 / freeHeap);
+  }
+
+  // Optionally, publish this information over MQTT
+  client.publish(FRAGMENTATION_TOPIC, String(heapFragmentation).c_str(), true);
+}
+
+void recordLoopTime() {
+  unsigned long currentMicros = micros();
+
+  if (loopStartTime != 0) {
+    // Calculate the duration of the last loop iteration
+    unsigned long loopDuration = currentMicros - loopStartTime;
+
+    // Accumulate the total duration and increment the loop count
+    loopDurationSum += loopDuration;
+    loopCount++;
+  }
+
+  // Update the loop start time for the next iteration
+  loopStartTime = currentMicros;
+}
+
+float getAndResetMeanLoopTime() {
+  float meanLoopTime = 0.0;
+
+  if (loopCount > 0) {
+    // Calculate the mean loop time in microseconds
+    meanLoopTime = (float)loopDurationSum / loopCount;
+  }
+
+  // Reset the counters for the next measurement period
+  loopDurationSum = 0;
+  loopCount = 0;
+
+  return meanLoopTime;
 }
 
 void publishIPState() {
