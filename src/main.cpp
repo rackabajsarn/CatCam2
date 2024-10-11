@@ -37,6 +37,7 @@ const char* password = WIFI_PASSWORD;
 #define DEVICE_NAME "catflap"
 #define DEVICE_UNIQUE_ID "catflap_esp32"
 #define MQTT_DISCOVERY_PREFIX "homeassistant"
+#define DEVICE_SW_VERSION "1.0.0" //Increment together with git commits
 
 // EEPROM Addresses
 #define EEPROM_SIZE 64
@@ -329,6 +330,8 @@ void mqttSubscribe() {
   client.subscribe(SET_DETECTION_MODE_TOPIC);
   client.subscribe(SET_DEBUG_TOGGLE_TOPIC);
   client.subscribe(SET_COOLDOWN_TOPIC);
+  client.subscribe(SET_FLAP_STATE_TOPIC);
+  client.subscribe(SET_CAT_LOCATION_TOPIC);  
   client.subscribe(INFERENCE_TOPIC);
 }
 
@@ -463,7 +466,10 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
   } else if (String(topic) == INFERENCE_TOPIC) {
     handleInferenceTopic(incomingMessage);
   } else if (String(topic) == SET_CAT_LOCATION_TOPIC) {
+    mqttDebugPrintln("set cat location");
     handleCatLocationCommand(incomingMessage);
+  } else {
+    mqttDebugPrintln("unknown topic");
   }
 }
 
@@ -523,6 +529,7 @@ void publishDiscoveryConfigs() {
   deviceInfo["name"] = "Cat Flap";
   deviceInfo["model"] = "AI Cat Flap";
   deviceInfo["manufacturer"] = "RB Advanced Intelligence Labs Inc.";
+  deviceInfo["sw_version"] = DEVICE_SW_VERSION;
   deviceInfo["configuration_url"] = "http://192.168.1.163:5000/classify";
   String irSensorConfigPayload;
   serializeJson(irSensorConfig, irSensorConfigPayload);
@@ -542,7 +549,7 @@ void publishDiscoveryConfigs() {
   client.publish(flapStateConfigTopic.c_str(), flapStateConfigPayload.c_str(), true);
 
   // Flap Control Switch
-  String flapSwitchConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/control/config";
+  String flapSwitchConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/flap_state/config";
   DynamicJsonDocument flapSwitchConfig(capacity);
   flapSwitchConfig["name"] = "Enable Cat Flap";
   flapSwitchConfig["command_topic"] = SET_FLAP_STATE_TOPIC;
@@ -585,7 +592,7 @@ void publishDiscoveryConfigs() {
   client.publish(catLocationConfigTopic.c_str(), catLocationConfigPayload.c_str(), true);
 
   // Set Home Switch
-  String setHomeSwitchConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/set_home/config";
+  String setHomeSwitchConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/cat_location/config";
   DynamicJsonDocument setHomeSwitchConfig(capacity);
   setHomeSwitchConfig["name"] = "Cat Home";
   setHomeSwitchConfig["command_topic"] = SET_CAT_LOCATION_TOPIC;
@@ -809,6 +816,19 @@ void publishDiscoveryConfigs() {
   String alertSensorConfigPayload;
   serializeJson(alertSensorConfig, alertSensorConfigPayload);
   client.publish(alertSensorConfigTopic.c_str(), alertSensorConfigPayload.c_str(), true);
+
+  // Inference Sensor
+  String inferenceSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/inference/config";
+  DynamicJsonDocument inferenceSensorConfig(512);
+  inferenceSensorConfig["name"] = "Inference Output";
+  inferenceSensorConfig["state_topic"] = INFERENCE_TOPIC;
+  inferenceSensorConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_inference";
+  inferenceSensorConfig["icon"] = "mdi:message-text";
+  JsonObject deviceInfoInference = inferenceSensorConfig.createNestedObject("device");
+  deviceInfoInference["identifiers"] = DEVICE_UNIQUE_ID;
+  String inferenceSensorConfigPayload;
+  serializeJson(inferenceSensorConfig, inferenceSensorConfigPayload);
+  client.publish(inferenceSensorConfigTopic.c_str(), inferenceSensorConfigPayload.c_str(), true);
 
   // Cooldown Number Entity
   String cooldownConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/cooldown/config";
