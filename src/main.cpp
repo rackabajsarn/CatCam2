@@ -466,7 +466,6 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
   } else if (String(topic) == INFERENCE_TOPIC) {
     handleInferenceTopic(incomingMessage);
   } else if (String(topic) == SET_CAT_LOCATION_TOPIC) {
-    mqttDebugPrintln("set cat location");
     handleCatLocationCommand(incomingMessage);
   } else {
     mqttDebugPrintln("unknown topic");
@@ -591,20 +590,20 @@ void publishDiscoveryConfigs() {
   serializeJson(catLocationConfig, catLocationConfigPayload);
   client.publish(catLocationConfigTopic.c_str(), catLocationConfigPayload.c_str(), true);
 
-  // Set Home Switch
-  String setHomeSwitchConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/cat_location/config";
-  DynamicJsonDocument setHomeSwitchConfig(capacity);
-  setHomeSwitchConfig["name"] = "Cat Home";
-  setHomeSwitchConfig["command_topic"] = SET_CAT_LOCATION_TOPIC;
-  setHomeSwitchConfig["state_topic"] = CAT_LOCATION_TOPIC;
-  setHomeSwitchConfig["payload_on"] = "ON";
-  setHomeSwitchConfig["payload_off"] = "OFF";
-  setHomeSwitchConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_set_home";
-  JsonObject deviceInfoSetHome = setHomeSwitchConfig.createNestedObject("device");
-  deviceInfoSetHome["identifiers"] = DEVICE_UNIQUE_ID;
-  String setHomeSwitchConfigPayload;
-  serializeJson(setHomeSwitchConfig, setHomeSwitchConfigPayload);
-  client.publish(setHomeSwitchConfigTopic.c_str(), setHomeSwitchConfigPayload.c_str(), true);
+  // Set Location Switch
+  String setLocationSwitchConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/cat_location/config";
+  DynamicJsonDocument setLocationSwitchConfig(capacity);
+  setLocationSwitchConfig["name"] = "Cat Home";
+  setLocationSwitchConfig["command_topic"] = SET_CAT_LOCATION_TOPIC;
+  setLocationSwitchConfig["state_topic"] = CAT_LOCATION_TOPIC;
+  setLocationSwitchConfig["payload_on"] = "ON";
+  setLocationSwitchConfig["payload_off"] = "OFF";
+  setLocationSwitchConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_set_location";
+  JsonObject deviceInfoSetLocation = setLocationSwitchConfig.createNestedObject("device");
+  deviceInfoSetLocation["identifiers"] = DEVICE_UNIQUE_ID;
+  String setLocationSwitchConfigPayload;
+  serializeJson(setLocationSwitchConfig, setLocationSwitchConfigPayload);
+  client.publish(setLocationSwitchConfigTopic.c_str(), setLocationSwitchConfigPayload.c_str(), true);
 
   // Debug Toggle Switch
   String debugToggleConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/debug_toggle/config";
