@@ -8,6 +8,7 @@
 #include <EEPROM.h>
 #include "esp_system.h" // This is needed to use esp_reset_reason()
 #include "secrets.h"
+#include "esp_wifi.h"
 
 // Wi-Fi credentials from secrets.h
 const char* ssid = WIFI_SSID;
@@ -19,7 +20,7 @@ const char* password = WIFI_PASSWORD;
 #define ALERT_TOPIC "catflap/alert"
 #define WIFI_SIGNAL_TOPIC "catflap/wifi_signal"
 #define FREE_HEAP_TOPIC "catflap/free_heap"
-#define FRAGMENTATION_TOPIC "catflap/fragmentation"
+#define ROUNDTRIP_TOPIC "catflap/roundtrip"
 #define LOOPTIME_TOPIC "catflap/looptime"
 #define IP_TOPIC "catflap/ip"
 #define IMAGE_TOPIC "catflap/image"
@@ -143,10 +144,10 @@ const unsigned long DIAGNOSTIC_UPDATE_INTERVAL = 15000;
 unsigned long loopStartTime = 0;
 unsigned long loopDurationSum = 0;
 unsigned long loopCount = 0;
-
+unsigned long roundTripTimer = 0;
 
 // Debounce and Cooldown Settings
-#define DEBOUNCE_DURATION_MS 50  // Debounce duration in milliseconds
+#define DEBOUNCE_DURATION_MS 30  // Debounce duration in milliseconds
 float cooldownDuration = 0.0;    // Cooldown duration in seconds (default to 0)
 unsigned long lastTriggerTime = 0;     // Timestamp of the last valid trigger
 unsigned long debounceStartTime = 0;   // Timestamp when debounce started
@@ -172,6 +173,8 @@ void setup() {
   pinMode(ENABLE_FLAP_PIN, OUTPUT);
 
   setup_wifi();
+    // Disable Wi-Fi power save mode
+  esp_wifi_set_ps(WIFI_PS_NONE);
 
   // Initialize MQTT
   client.setServer(MQTT_SERVER, 1883);
@@ -211,7 +214,8 @@ void loop() {
   }
 
   publishDiagnostics();
-  delay(10);  // Small delay to prevent watchdog resets
+  //delay(10);  // Small delay to prevent watchdog resets
+  yield();
 }
 
 void checkResetReason() {
@@ -277,6 +281,7 @@ void setup_wifi() {
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
   // Wait for connection
   while (WiFi.status() != WL_CONNECTED) {
@@ -394,6 +399,7 @@ void initCamera() {
 }
 
 void captureAndSendImage() {
+  roundTripTimer = millis();
   camera_fb_t * fb = esp_camera_fb_get();
   esp_camera_fb_return(fb);
   fb = esp_camera_fb_get();
@@ -410,6 +416,7 @@ void captureAndSendImage() {
 
   // Publish the image over MQTT
   if (client.connected()) {
+    mqttDebugPrintln("connected");
     if (client.publish(IMAGE_TOPIC, encodedImage.c_str(), true))
     {
       mqttDebugPrintln("Image sent via mqtt");
@@ -904,20 +911,20 @@ void publishDiscoveryConfigs() {
   serializeJson(freeHeapSensorConfig, freeHeapSensorConfigPayload);
   client.publish(freeHeapSensorConfigTopic.c_str(), freeHeapSensorConfigPayload.c_str(), true);
 
-    // Fragmentation Sensor
-  String fragmentationSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/fragmentation/config";
-  DynamicJsonDocument fragmentationSensorConfig(512);
-  fragmentationSensorConfig["name"] = "Fragmentation";
-  fragmentationSensorConfig["state_topic"] = FRAGMENTATION_TOPIC;
-  fragmentationSensorConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_fragmentation";
-  fragmentationSensorConfig["unit_of_measurement"] = "%";
-  fragmentationSensorConfig["entity_category"] = "diagnostic";
-  fragmentationSensorConfig["state_class"] = "measurement";
-  JsonObject deviceInfoFragmentation = fragmentationSensorConfig.createNestedObject("device");
-  deviceInfoFragmentation["identifiers"] = DEVICE_UNIQUE_ID;
-  String fragmentationSensorConfigPayload;
-  serializeJson(fragmentationSensorConfig, fragmentationSensorConfigPayload);
-  client.publish(fragmentationSensorConfigTopic.c_str(), fragmentationSensorConfigPayload.c_str(), true);
+    // Roundtrip Time Sensor
+  String roundtripSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/roundtrip/config";
+  DynamicJsonDocument roundtripSensorConfig(512);
+  roundtripSensorConfig["name"] = "Roundtrip time";
+  roundtripSensorConfig["state_topic"] = ROUNDTRIP_TOPIC;
+  roundtripSensorConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_roundtrip";
+  roundtripSensorConfig["unit_of_measurement"] = "ms";
+  roundtripSensorConfig["entity_category"] = "diagnostic";
+  roundtripSensorConfig["state_class"] = "measurement";
+  JsonObject deviceInfoRoundtrip = roundtripSensorConfig.createNestedObject("device");
+  deviceInfoRoundtrip["identifiers"] = DEVICE_UNIQUE_ID;
+  String roundtripSensorConfigPayload;
+  serializeJson(roundtripSensorConfig, roundtripSensorConfigPayload);
+  client.publish(roundtripSensorConfigTopic.c_str(), roundtripSensorConfigPayload.c_str(), true);
 
   // Looptime Sensor
   String looptimeSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/looptime/config";
@@ -936,6 +943,7 @@ void publishDiscoveryConfigs() {
 }
 
 void handleInferenceTopic(String inferenceStr) {
+  client.publish(ROUNDTRIP_TOPIC, String(millis()-roundTripTimer).c_str(), true);
   if (inferenceStr == "not_cat"){
     /* code */
   } else if (inferenceStr == "cat_morris_entering") {
@@ -1224,30 +1232,9 @@ void publishDiagnostics() {
     client.publish(WIFI_SIGNAL_TOPIC, wifiSignalStr.c_str(), true);
     String freeHeap = String(ESP.getFreeHeap());
     client.publish(FREE_HEAP_TOPIC, freeHeap.c_str(), true);
-    monitorHeap();
     String loopTime = String(getAndResetMeanLoopTime());
     client.publish(LOOPTIME_TOPIC, loopTime.c_str(), true);
   }
-}
-
-
-
-void monitorHeap() {
-  multi_heap_info_t heap_info;
-  heap_caps_get_info(&heap_info, MALLOC_CAP_DEFAULT);
-
-  size_t freeHeap = heap_info.total_free_bytes;
-  size_t minFreeHeap = heap_info.minimum_free_bytes;
-  size_t largestFreeBlock = heap_info.largest_free_block;
-
-  // Calculate heap fragmentation as a percentage
-  uint8_t heapFragmentation = 0;
-  if (freeHeap > 0) {
-    heapFragmentation = (uint8_t)((freeHeap - largestFreeBlock) * 100 / freeHeap);
-  }
-
-  // Optionally, publish this information over MQTT
-  client.publish(FRAGMENTATION_TOPIC, String(heapFragmentation).c_str(), true);
 }
 
 void recordLoopTime() {
