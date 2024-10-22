@@ -410,14 +410,11 @@ void captureAndSendImage() {
     return;
   }
 
-  // Base64 encode the image
-  String encodedImage = base64::encode(fb->buf, fb->len);
-  mqttDebugPrintf("Encoded image size: %u bytes\n", encodedImage.length());
+  mqttDebugPrintf("Image size: %u bytes\n", fb->len);
 
   // Publish the image over MQTT
   if (client.connected()) {
-    mqttDebugPrintln("connected");
-    if (client.publish(IMAGE_TOPIC, encodedImage.c_str(), true))
+    if (client.publish(IMAGE_TOPIC, fb->buf, fb->len, true))
     {
       mqttDebugPrintln("Image sent via mqtt");
     } else {
@@ -645,7 +642,6 @@ void publishDiscoveryConfigs() {
   cameraConfig["name"] = "Last Image";
   cameraConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_camera";
   cameraConfig["topic"] = IMAGE_TOPIC;
-  cameraConfig["image_encoding"] = "b64";  // Specify the image encoding as Base64
   JsonObject deviceInfo4 = cameraConfig.createNestedObject("device");
   deviceInfo4["identifiers"] = DEVICE_UNIQUE_ID;
   String cameraConfigPayload;
