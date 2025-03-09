@@ -9,6 +9,8 @@
 #include "esp_system.h" // This is needed to use esp_reset_reason()
 #include "secrets.h"
 #include "esp_wifi.h"
+#include "esp_heap_caps.h"
+
 
 // Wi-Fi credentials from secrets.h
 const char* ssid = WIFI_SSID;
@@ -41,7 +43,7 @@ const char* password = WIFI_PASSWORD;
 #define DEVICE_NAME "catflap"
 #define DEVICE_UNIQUE_ID "catflap_esp32"
 #define MQTT_DISCOVERY_PREFIX "homeassistant"
-#define DEVICE_SW_VERSION "1.0.1" //Increment together with git commits
+#define DEVICE_SW_VERSION "1.0.2" //Increment together with git commits
 
 // EEPROM Addresses
 #define EEPROM_SIZE 64
@@ -55,6 +57,8 @@ const char* password = WIFI_PASSWORD;
 #define IR_PIN          32
 //#define OPEN_SENSOR_PIN 32
 #define ENABLE_FLAP_PIN 33 //TODO: Double check 13 or 14
+
+#define BPP 1  // Grayscale: 1 byte per pixel
 
 // Camera pin configuration
 #define PWDN_GPIO_NUM    -1
@@ -75,6 +79,14 @@ const char* password = WIFI_PASSWORD;
 #define HREF_GPIO_NUM    23
 #define PCLK_GPIO_NUM    22
 
+
+// Structure to accumulate JPEG data
+typedef struct {
+  uint8_t *buf;      // Pointer to output buffer
+  size_t buf_size;   // Total allocated size
+  size_t offset;     // Current offset (number of bytes written)
+} jpg_chunk_t;
+
 // Forward declarations of functions
 void checkResetReason();
 void setup_wifi();
@@ -84,6 +96,10 @@ void mqttSubscribe();
 void mqttInitialPublish();
 void initCamera();
 void captureAndSendImage();
+void processCroppedAndConvert(camera_fb_t *cropped);
+unsigned int jpgOutputCallback(void *arg, size_t index, const void *data, size_t len);
+camera_fb_t* cropImage(camera_fb_t *fb);
+camera_fb_t* resizeImage(camera_fb_t *cropped, int originalSize, int targetSize);
 void enableFlap();
 void disableFlap();
 void handleMqttMessages(char* topic, byte* payload, unsigned int length);
@@ -381,7 +397,7 @@ void initCamera() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
+  config.pixel_format = PIXFORMAT_GRAYSCALE;
   config.fb_location = CAMERA_FB_IN_PSRAM;  // Use internal DRAM
 
   // Frame parameters
@@ -398,6 +414,64 @@ void initCamera() {
   }
 }
 
+
+// Example callback function for frame2jpg_cb.
+// This function will be called repeatedly with chunks of JPEG data.
+unsigned int jpgOutputCallback(void *arg, size_t index, const void *data, size_t len) {
+  jpg_chunk_t *chunk = (jpg_chunk_t*) arg;
+  // Check if there is enough space in the buffer; you may choose to enlarge the buffer here.
+  if (chunk->offset + len > chunk->buf_size) {
+      // In this example, if the buffer is too small, we simply return 0 to signal an error.
+      Serial.println("Output buffer overflow");
+      return 0;
+  }
+  // Copy the data chunk into our output buffer.
+  memcpy(chunk->buf + chunk->offset, data, len);
+  chunk->offset += len;
+  // Return the number of bytes written.
+  return len;
+}
+
+// Function to process the cropped frame and convert it to JPEG.
+void processCroppedAndConvert(camera_fb_t *cropped) {
+  int quality = 12;  // Adjust quality as needed.
+  
+  // Prepare a structure to accumulate JPEG data.
+  // Choose an output buffer size large enough for your expected JPEG image.
+  size_t output_buffer_size = 20 * 1024; // e.g., 20KB (adjust as needed)
+  jpg_chunk_t jpgChunk;
+  jpgChunk.buf = (uint8_t*) malloc(output_buffer_size);
+  if (!jpgChunk.buf) {
+      Serial.println("Failed to allocate JPEG output buffer");
+      // Free cropped frame before returning.
+      heap_caps_free(cropped->buf);
+      heap_caps_free(cropped);
+      return;
+  }
+  jpgChunk.buf_size = output_buffer_size;
+  jpgChunk.offset = 0;
+  
+  // Call frame2jpg_cb on the cropped frame.
+  // The callback will be called repeatedly to fill our output buffer.
+  esp_err_t res = frame2jpg_cb(cropped, quality, jpgOutputCallback, &jpgChunk);
+  if (res != ESP_OK) {
+      Serial.printf("frame2jpg_cb failed: %d\n", res);
+      free(jpgChunk.buf);
+  } else {
+      Serial.printf("JPEG conversion succeeded, total %u bytes\n", jpgChunk.offset);
+      // At this point, jpgChunk.buf contains the JPEG data, with jpgChunk.offset bytes.
+      // You can now publish it via MQTT or store it as needed.
+      // For example:
+      // client.publish(IMAGE_TOPIC, jpgChunk.buf, jpgChunk.offset, true);
+  }
+  
+  // Free resources.
+  free(jpgChunk.buf);
+  // Free the cropped frame memory.
+  if (cropped->buf) heap_caps_free(cropped->buf);
+  heap_caps_free(cropped);
+}
+
 void captureAndSendImage() {
   roundTripTimer = millis();
   camera_fb_t * fb = esp_camera_fb_get();
@@ -409,12 +483,33 @@ void captureAndSendImage() {
 
     return;
   }
+ // TODO: Fix this properly, i think the fb needs to be manipulated directly, since the fram2jpg_cb is expecting camera fb
+  
+  // Crop the image to a centered 384x384 square in PSRAM.
+  camera_fb_t *cropped = cropFrame(fb);
+  if (!cropped) {
+      esp_camera_fb_return(fb);
+      return;
+  }
 
-  mqttDebugPrintf("Image size: %u bytes\n", fb->len);
+  // Resize the cropped image to 96x96.
+  camera_fb_t *resized = resizeFrame(cropped);
+  if (!resized) {
+      esp_camera_fb_return(fb);
+      return;
+  }
+
+  // function for inference
+
+  // Free the resized frame's buffer and struct.
+  if (resized->buf) heap_caps_free(resized->buf);
+  heap_caps_free(resized);
+
+  processCroppedAndConvert(cropped);
 
   // Publish the image over MQTT
   if (client.connected()) {
-    if (client.publish(IMAGE_TOPIC, fb->buf, fb->len, true))
+    if (client.publish(IMAGE_TOPIC, cropped->buf, cropped->len, true))
     {
       mqttDebugPrintln("Image sent via mqtt");
     } else {
@@ -423,6 +518,82 @@ void captureAndSendImage() {
   }
 
   esp_camera_fb_return(fb);
+}
+
+// Function to crop a centered 384x384 square from the frame.
+// Returns a pointer to the cropped image data (allocated in PSRAM) or NULL on failure.
+camera_fb_t* cropFrame(camera_fb_t *fb) {
+  const int cropSize = 384;
+  // Allocate a new camera_fb_t structure in PSRAM.
+  camera_fb_t *cropped = (camera_fb_t*) heap_caps_malloc(sizeof(camera_fb_t), MALLOC_CAP_SPIRAM);
+  if (!cropped) {
+      Serial.println("Failed to allocate memory for cropped frame struct");
+      return NULL;
+  }
+  cropped->width  = cropSize;
+  cropped->height = cropSize;
+  cropped->format = PIXFORMAT_GRAYSCALE;
+  cropped->len    = cropSize * cropSize * BPP;
+  // Allocate the image buffer in PSRAM.
+  cropped->buf = (uint8_t*) heap_caps_malloc(cropped->len, MALLOC_CAP_SPIRAM);
+  if (!cropped->buf) {
+      Serial.println("Failed to allocate buffer for cropped frame");
+      heap_caps_free(cropped);
+      return NULL;
+  }
+
+  // Calculate top-left corner of the crop.
+  int left = (fb->width - cropSize) / 2;
+  int top  = (fb->height - cropSize) / 2;
+
+  // Copy pixels from the original frame to the cropped buffer.
+  for (int y = 0; y < cropSize; y++) {
+      int srcY = top + y;
+      for (int x = 0; x < cropSize; x++) {
+          int srcX = left + x;
+          int srcIndex = srcY * fb->width + srcX; // Since BPP=1
+          int dstIndex = y * cropSize + x;
+          cropped->buf[dstIndex] = fb->buf[srcIndex];
+      }
+  }
+  return cropped;
+}
+
+// Function to resize the cropped image from originalSize x originalSize (384x384)
+// to targetSize x targetSize (96x96) using nearest-neighbor scaling.
+// Returns a pointer to the resized image data (allocated in PSRAM) or NULL on failure.
+camera_fb_t* resizeFrame(camera_fb_t *cropped) {
+  const int targetSize = 96;
+  int originalSize = cropped->width;  // should be 384
+  // Allocate a new camera_fb_t structure for the resized image.
+  camera_fb_t *resized = (camera_fb_t*) heap_caps_malloc(sizeof(camera_fb_t), MALLOC_CAP_SPIRAM);
+  if (!resized) {
+      Serial.println("Failed to allocate memory for resized frame struct");
+      return NULL;
+  }
+  resized->width  = targetSize;
+  resized->height = targetSize;
+  resized->format = PIXFORMAT_GRAYSCALE;
+  resized->len    = targetSize * targetSize * BPP;
+  resized->buf = (uint8_t*) heap_caps_malloc(resized->len, MALLOC_CAP_SPIRAM);
+  if (!resized->buf) {
+      Serial.println("Failed to allocate buffer for resized frame");
+      heap_caps_free(resized);
+      return NULL;
+  }
+
+  float scale = (float)originalSize / targetSize;  // In our case, 384/96 = 4.0
+  // Nearest-neighbor resizing.
+  for (int y = 0; y < targetSize; y++) {
+      for (int x = 0; x < targetSize; x++) {
+          int srcX = (int)(x * scale);
+          int srcY = (int)(y * scale);
+          int srcIndex = srcY * originalSize + srcX;
+          int dstIndex = y * targetSize + x;
+          resized->buf[dstIndex] = cropped->buf[srcIndex];
+      }
+  }
+  return resized;
 }
 
 void enableFlap() {
