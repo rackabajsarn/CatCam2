@@ -10,6 +10,8 @@
 #include "secrets.h"
 #include "esp_wifi.h"
 #include "esp_heap_caps.h"
+#include <ArduTFLite.h>
+#include "model.h"
 
 
 // Wi-Fi credentials from secrets.h
@@ -56,7 +58,7 @@ const char* password = WIFI_PASSWORD;
 // GPIO Definitions
 #define IR_PIN          32
 //#define OPEN_SENSOR_PIN 32
-#define ENABLE_FLAP_PIN 33 //TODO: Double check 13 or 14
+#define ENABLE_FLAP_PIN 33
 
 #define BPP 1  // Grayscale: 1 byte per pixel
 
@@ -169,6 +171,19 @@ unsigned long lastTriggerTime = 0;     // Timestamp of the last valid trigger
 unsigned long debounceStartTime = 0;   // Timestamp when debounce started
 bool debounceActive = false;           // Flag to indicate debounce is in progress
 
+// The Tensor Arena memory area is used by TensorFlow Lite to store input, output and intermediate tensors
+// It must be defined as a global array of byte (or u_int8 which is the same type on Arduino) 
+// The Tensor Arena size must be defined by trials and errors. We use here a quite large value.
+// The alignas(16) directive is used to ensure that the array is aligned on a 16-byte boundary,
+// this is important for performance and to prevent some issues on ARM microcontroller architectures.
+// Adjust this based on your model's requirements.
+constexpr int kTensorArenaSize = 20 * 1024;  // For example, 20KB; adjust as needed.
+uint8_t tensor_arena[kTensorArenaSize];
+
+// Global pointers for the model and interpreter.
+const tflite::Model* model = nullptr;
+tflite::MicroInterpreter* interpreter = nullptr;
+
 
 void setup() {
   Serial.begin(115200);
@@ -202,6 +217,9 @@ void setup() {
   setupOTA();  // Initialize OTA
   checkResetReason();
   publishIPState();
+
+  setupInference();
+
   mqttDebugPrintln("ESP Setup finished");
 }
 
@@ -414,6 +432,65 @@ void initCamera() {
   }
 }
 
+// Setup function to initialize the model and interpreter.
+void setupInference() {
+  Serial.println("Setting up inference...");
+  // Load the model from flash.
+  model = tflite::GetModel(my_model_quant_tflite);
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.printf("Model schema version (%d) does not match TFLite Micro schema version (%d).\n",
+                  model->version(), TFLITE_SCHEMA_VERSION);
+    return;
+  }
+  
+  // Create an op resolver.
+  static tflite::AllOpsResolver resolver;
+  
+  // Create a persistent interpreter.
+  static tflite::MicroInterpreter static_interpreter(model, resolver, tensor_arena, kTensorArenaSize);
+  interpreter = &static_interpreter;
+  
+  // Allocate tensors.
+  TfLiteStatus allocate_status = interpreter->AllocateTensors();
+  if (allocate_status != kTfLiteOk) {
+    Serial.println("AllocateTensors() failed");
+    return;
+  }
+  
+  Serial.println("Inference setup complete.");
+}
+
+// Run inference using the persistent interpreter.
+// 'input_data' must match the model's expected input size.
+bool run_inference(uint8_t* input_data, size_t input_data_size) {
+  // Get the model's input tensor.
+  TfLiteTensor* input = interpreter->input(0);
+  if (input_data_size != input->bytes) {
+    Serial.printf("Input data size (%d) does not match model input size (%d)\n",
+                  input_data_size, input->bytes);
+    return false;  // or handle the error as needed
+  }
+  
+  // Copy the input data into the input tensor.
+  memcpy(input->data.uint8, input_data, input_data_size);
+  
+  // Run inference.
+  TfLiteStatus invoke_status = interpreter->Invoke();
+  if (invoke_status != kTfLiteOk) {
+    Serial.println("Invoke failed");
+    return false;
+  }
+  
+  // Get the output tensor.
+  TfLiteTensor* output = interpreter->output(0);
+  
+  // For a two-element output:
+  // output->data.uint8[0] is the score for "no prey"
+  // output->data.uint8[1] is the score for "prey"
+  bool preyDetected = output->data.uint8[1] > output->data.uint8[0];
+  
+  return preyDetected;
+}
 
 // Example callback function for frame2jpg_cb.
 // This function will be called repeatedly with chunks of JPEG data.
@@ -483,7 +560,6 @@ void captureAndSendImage() {
 
     return;
   }
- // TODO: Fix this properly, i think the fb needs to be manipulated directly, since the fram2jpg_cb is expecting camera fb
   
   // Crop the image to a centered 384x384 square in PSRAM.
   camera_fb_t *cropped = cropFrame(fb);
@@ -499,7 +575,21 @@ void captureAndSendImage() {
       return;
   }
 
-  // function for inference
+  // For demonstration purposes, let's create a dummy input.
+  static uint8_t processed_img[96 * 96] = {0};
+  // Fill processed_img with dummy data if needed.
+  
+  // Run inference on the processed image. 
+  // TODO: Handling of closing hatch
+  if(run_inference(processed_img, sizeof(processed_img)))
+  {
+    mqttDebugPrintln("Prey detected!");
+  }
+  else
+  {
+    mqttDebugPrintln("No prey detected.");
+  }  
+
 
   // Free the resized frame's buffer and struct.
   if (resized->buf) heap_caps_free(resized->buf);
