@@ -12,6 +12,8 @@
 #include "esp_heap_caps.h"
 #include <ArduTFLite.h>
 #include "model.h"
+#include <SD.h>
+#include <SPI.h>
 
 
 // Wi-Fi credentials from secrets.h
@@ -40,6 +42,15 @@ const char* password = WIFI_PASSWORD;
 #define SET_CAT_LOCATION_TOPIC "catflap/cat_location/set"
 #define SET_FLAP_STATE_TOPIC "catflap/flap_state/set"
 #define INFERENCE_TOPIC "catflap/inference"
+#define SET_EXPOSURE_CTRL_TOPIC "catflap/exposure_ctrl/set"
+#define SET_AEC_VALUE_TOPIC "catflap/aec_value/set"
+#define EXPOSURE_CTRL_TOPIC "catflap/exposure_ctrl"
+#define AEC_VALUE_TOPIC "catflap/aec_value"
+#define SET_JPEG_QUALITY_TOPIC "catflap/jpeg_quality/set"
+#define SET_BRIGHTNESS_TOPIC "catflap/brightness/set"
+#define SET_CONTRAST_TOPIC "catflap/contrast/set"
+#define SET_SATURATION_TOPIC "catflap/saturation/set"
+#define SET_AWB_TOPIC "catflap/awb/set"
 
 // Device information
 #define DEVICE_NAME "catflap"
@@ -49,11 +60,17 @@ const char* password = WIFI_PASSWORD;
 
 // EEPROM Addresses
 #define EEPROM_SIZE 64
-#define EEPROM_VERSION 2  // Increment this number whenever you change the EEPROM layout
+#define EEPROM_VERSION 3  // Bump from 2 to 3
 #define EEPROM_ADDRESS_VERSION 0
 #define EEPROM_ADDRESS_DETECTION_MODE 1
-#define EEPROM_ADDR_COOLDOWN 2  // Assuming previous addresses are 0 and 1
-#define EEPROM_ADDRESS_CAMERA_SETTINGS 3  // Starting address for camera settings
+#define EEPROM_ADDR_COOLDOWN 2
+#define EEPROM_ADDRESS_CAMERA_QUALITY 3
+#define EEPROM_ADDRESS_CAMERA_BRIGHTNESS 4
+#define EEPROM_ADDRESS_CAMERA_CONTRAST 5
+#define EEPROM_ADDRESS_CAMERA_SATURATION 6
+#define EEPROM_ADDRESS_CAMERA_AWB 7
+#define EEPROM_ADDRESS_CAMERA_EXPOSURE_CTRL 8
+#define EEPROM_ADDRESS_CAMERA_AEC_VALUE 9  // Uses 2 bytes (9-10)
 
 // GPIO Definitions
 #define IR_PIN          32
@@ -117,14 +134,14 @@ void mqttDebugPrint(const char* message);
 void mqttDebugPrintln(const char* message);
 void mqttDebugPrintf(const char* format, ...);
 void handleInferenceTopic(String inferenceStr);
-void handleFrameSizeCommand(String frameSizeStr);
 void handleJpegQualityCommand(String qualityStr);
 void publishCameraSettings();
 void handleBrightnessCommand(String brightnessStr);
 void handleContrastCommand(String contrastStr);
 void handleSaturationCommand(String saturationStr);
 void handleAWBCommand(String awbStateStr);
-void handleSpecialEffectCommand(String effectStr);
+void handleExposureCtrlCommand(String stateStr);
+void handleAECValueCommand(String aecStr);
 void handleCooldownCommand(String cooldownStr);
 void handleIRBarrierStateChange(bool barrierBroken);
 void saveSettingsToEEPROM();
@@ -136,6 +153,7 @@ void handleFlapStateCommand(String stateStr);
 void updateIRBarrierState();
 bool isEEPROMInitialized();
 void initializeEEPROM();
+
 // Add more handler functions as needed
 
 WiFiClient espClient;
@@ -184,10 +202,26 @@ uint8_t tensor_arena[kTensorArenaSize];
 const tflite::Model* model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
 
+// Global pointer to hold the dynamically loaded model.
+uint8_t* g_model_data = nullptr;
+size_t g_model_size = 0;
 
 void setup() {
   Serial.begin(115200);
-
+  delay(1000);  // Wait for Serial
+  
+  // Initialize SD card (using SPI, adjust SS pin if needed).
+  if (!SD.begin()) {
+    Serial.println("SD card initialization failed");
+    while (true) { delay(1000); }
+  }
+  Serial.println("SD card initialized");
+  
+  // Load the model from the SD card.
+  if (!loadModelFromSD("/model.tflite", &g_model_data, &g_model_size)) {
+    Serial.println("Model loading failed");
+    while (true) { delay(1000); }
+  }
   initCamera();
 
   // Initialize EEPROM
@@ -369,20 +403,25 @@ void mqttReconnect() {
 }
 
 void mqttSubscribe() {
-  client.subscribe(COMMAND_TOPIC);
-  client.subscribe("catflap/frame_size/set");
-  client.subscribe("catflap/jpeg_quality/set");
-  client.subscribe("catflap/brightness/set");
-  client.subscribe("catflap/contrast/set");
-  client.subscribe("catflap/saturation/set");
-  client.subscribe("catflap/awb/set");
-  client.subscribe("catflap/special_effect/set");
-  client.subscribe(SET_DETECTION_MODE_TOPIC);
-  client.subscribe(SET_DEBUG_TOGGLE_TOPIC);
-  client.subscribe(SET_COOLDOWN_TOPIC);
-  client.subscribe(SET_FLAP_STATE_TOPIC);
-  client.subscribe(SET_CAT_LOCATION_TOPIC);  
-  client.subscribe(INFERENCE_TOPIC);
+    // System commands
+    client.subscribe(COMMAND_TOPIC);
+    client.subscribe(INFERENCE_TOPIC);
+
+    // Camera settings
+    client.subscribe(SET_JPEG_QUALITY_TOPIC);
+    client.subscribe(SET_BRIGHTNESS_TOPIC);
+    client.subscribe(SET_CONTRAST_TOPIC);
+    client.subscribe(SET_SATURATION_TOPIC);
+    client.subscribe(SET_AWB_TOPIC);
+    client.subscribe(SET_EXPOSURE_CTRL_TOPIC);
+    client.subscribe(SET_AEC_VALUE_TOPIC);
+
+    // Operational settings
+    client.subscribe(SET_DETECTION_MODE_TOPIC);
+    client.subscribe(SET_DEBUG_TOGGLE_TOPIC);
+    client.subscribe(SET_COOLDOWN_TOPIC);
+    client.subscribe(SET_FLAP_STATE_TOPIC);
+    client.subscribe(SET_CAT_LOCATION_TOPIC);
 }
 
 void mqttInitialPublish() {
@@ -432,11 +471,90 @@ void initCamera() {
   }
 }
 
+// Function to load the model file from the SD card into memory.
+bool loadModelFromSD(const char* modelPath, uint8_t** modelBuffer, size_t* modelSize) {
+  File modelFile = SD.open(modelPath, FILE_READ);
+  if (!modelFile) {
+    Serial.println("Failed to open model file on SD card");
+    return false;
+  }
+  
+  *modelSize = modelFile.size();
+  // Allocate buffer in PSRAM if available.
+  *modelBuffer = (uint8_t*) heap_caps_malloc(*modelSize, MALLOC_CAP_SPIRAM);
+  if (!*modelBuffer) {
+    Serial.println("Failed to allocate memory for model");
+    modelFile.close();
+    return false;
+  }
+  
+  // Read the file into the buffer.
+  size_t bytesRead = modelFile.read(*modelBuffer, *modelSize);
+  modelFile.close();
+  
+  if (bytesRead != *modelSize) {
+    Serial.println("Error reading the complete model file");
+    heap_caps_free(*modelBuffer);
+    return false;
+  }
+  
+  Serial.printf("Model loaded: %d bytes\n", *modelSize);
+  return true;
+}
+
+bool updateModelFromSD() {
+  // Check if a new model file exists, e.g. "model_new.tflite"
+  if (SD.exists("/model_new.tflite")) {
+    // Optional: Validate the new file (size, checksum, etc.)
+    File newModel = SD.open("/model_new.tflite", FILE_READ);
+    if (!newModel) {
+      Serial.println("Failed to open new model file.");
+      return false;
+    }
+    size_t newSize = newModel.size();
+    newModel.close();
+    
+    // Remove the old model file.
+    if (SD.exists("/model.tflite")) {
+      SD.remove("/model.tflite");
+    }
+
+    // If validation passes, rename the file.
+    if (SD.rename("/model_new.tflite", "/model.tflite")) {
+      Serial.println("Model updated successfully.");
+      return true;
+    } else {
+      Serial.println("Failed to rename the model file.");
+    }
+  }
+  return false;
+}
+
+void reloadModel() {
+  // Free the current model data if allocated.
+  if (g_model_data) {
+    heap_caps_free(g_model_data);
+    g_model_data = nullptr;
+  }
+  
+  // Load the new model from SD.
+  if (loadModelFromSD("/model.tflite", &g_model_data, &g_model_size)) {
+    // Reinitialize the TFLite Micro interpreter with the new model.
+    if (!setupInference()) {
+      Serial.println("Failed to reinitialize inference with the new model");
+    } else {
+      Serial.println("New model loaded and interpreter reinitialized.");
+    }
+  } else {
+    Serial.println("Failed to load the new model from SD");
+  }
+}
+
 // Setup function to initialize the model and interpreter.
-void setupInference() {
+bool setupInference() {
   Serial.println("Setting up inference...");
   // Load the model from flash.
-  model = tflite::GetModel(my_model_quant_tflite);
+  model = tflite::GetModel(g_model_data);
   if (model->version() != TFLITE_SCHEMA_VERSION) {
     Serial.printf("Model schema version (%d) does not match TFLite Micro schema version (%d).\n",
                   model->version(), TFLITE_SCHEMA_VERSION);
@@ -458,6 +576,7 @@ void setupInference() {
   }
   
   Serial.println("Inference setup complete.");
+  return true;
 }
 
 // Run inference using the persistent interpreter.
@@ -580,16 +699,17 @@ void captureAndSendImage() {
   // Fill processed_img with dummy data if needed.
   
   // Run inference on the processed image. 
-  // TODO: Handling of closing hatch
+  // TODO: Handling of closing hatch. If working good, normally locked?
   if(run_inference(processed_img, sizeof(processed_img)))
   {
-    mqttDebugPrintln("Prey detected!");
+    handleFlapStateCommand("OFF");
+    client.publish(INFERENCE_TOPIC, "Prey detected", true);
   }
   else
   {
-    mqttDebugPrintln("No prey detected.");
+    handleFlapStateCommand("ON");
   }  
-
+  client.publish(ROUNDTRIP_TOPIC, String(millis()-roundTripTimer).c_str(), true);
 
   // Free the resized frame's buffer and struct.
   if (resized->buf) heap_caps_free(resized->buf);
@@ -717,20 +837,16 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
     } else if (incomingMessage.equalsIgnoreCase("restart")) {
       ESP.restart();
     }
-  } else if (String(topic) == "catflap/frame_size/set") {
-    handleFrameSizeCommand(incomingMessage);
-  } else if (String(topic) == "catflap/jpeg_quality/set") {
+  } else if (String(topic) == SET_JPEG_QUALITY_TOPIC) {
     handleJpegQualityCommand(incomingMessage);
-  } else if (String(topic) == "catflap/brightness/set") {
+  } else if (String(topic) == SET_BRIGHTNESS_TOPIC) {
     handleBrightnessCommand(incomingMessage);
-  } else if (String(topic) == "catflap/contrast/set") {
+  } else if (String(topic) == SET_CONTRAST_TOPIC) {
     handleContrastCommand(incomingMessage);
-  } else if (String(topic) == "catflap/saturation/set") {
+  } else if (String(topic) == SET_SATURATION_TOPIC) {
     handleSaturationCommand(incomingMessage);
-  } else if (String(topic) == "catflap/awb/set") {
+  } else if (String(topic) == SET_AWB_TOPIC) {
     handleAWBCommand(incomingMessage);
-  } else if (String(topic) == "catflap/special_effect/set") {
-    handleSpecialEffectCommand(incomingMessage);
   } else if (String(topic) == SET_DETECTION_MODE_TOPIC) {
     handleDetectionModeCommand(incomingMessage);
   } else if (String(topic) == SET_FLAP_STATE_TOPIC) {
@@ -743,6 +859,10 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
     handleInferenceTopic(incomingMessage);
   } else if (String(topic) == SET_CAT_LOCATION_TOPIC) {
     handleCatLocationCommand(incomingMessage);
+  } else if (String(topic) == SET_EXPOSURE_CTRL_TOPIC) {
+    handleExposureCtrlCommand(incomingMessage);
+  } else if (String(topic) == SET_AEC_VALUE_TOPIC) {
+    handleAECValueCommand(incomingMessage);
   } else {
     mqttDebugPrintln("unknown topic");
   }
@@ -909,26 +1029,6 @@ void publishDiscoveryConfigs() {
   serializeJson(cameraConfig, cameraConfigPayload);
   client.publish(cameraConfigTopic.c_str(), cameraConfigPayload.c_str(), true);
 
-  // Frame Size Select
-  String frameSizeConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/select/" + DEVICE_NAME + "/frame_size/config";
-  DynamicJsonDocument frameSizeConfig(capacity);
-  frameSizeConfig["name"] = "Camera Frame Size";
-  frameSizeConfig["command_topic"] = "catflap/frame_size/set";
-  //frameSizeConfig["entity_category"] = "configuration";
-  frameSizeConfig["state_topic"] = "catflap/frame_size";
-  frameSizeConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_frame_size";
-  JsonArray frameSizeOptions = frameSizeConfig.createNestedArray("options");
-  frameSizeOptions.add("QQVGA");
-  frameSizeOptions.add("QVGA");
-  frameSizeOptions.add("VGA");
-  frameSizeOptions.add("SVGA");
-  // Add other frame sizes as needed
-  JsonObject deviceInfoFrameSize = frameSizeConfig.createNestedObject("device");
-  deviceInfoFrameSize["identifiers"] = DEVICE_UNIQUE_ID;
-  String frameSizeConfigPayload;
-  serializeJson(frameSizeConfig, frameSizeConfigPayload);
-  client.publish(frameSizeConfigTopic.c_str(), frameSizeConfigPayload.c_str(), true);
-
   // JPEG Quality Number
   String jpegQualityConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/jpeg_quality/config";
   DynamicJsonDocument jpegQualityConfig(capacity);
@@ -1012,29 +1112,6 @@ void publishDiscoveryConfigs() {
   String awbConfigPayload;
   serializeJson(awbConfig, awbConfigPayload);
   client.publish(awbConfigTopic.c_str(), awbConfigPayload.c_str(), true);
-
-  // Special Effect Select
-  String specialEffectConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/select/" + DEVICE_NAME + "/special_effect/config";
-  DynamicJsonDocument specialEffectConfig(capacity);
-  specialEffectConfig["name"] = "Camera Special Effect";
-  specialEffectConfig["command_topic"] = "catflap/special_effect/set";
-  //specialEffectConfig["entity_category"] = "configuration";
-  specialEffectConfig["state_topic"] = "catflap/special_effect";
-  specialEffectConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_special_effect";
-  JsonArray effectOptions = specialEffectConfig.createNestedArray("options");
-  effectOptions.add("No Effect");
-  effectOptions.add("Negative");
-  effectOptions.add("Grayscale");
-  effectOptions.add("Red Tint");
-  effectOptions.add("Green Tint");
-  effectOptions.add("Blue Tint");
-  effectOptions.add("Sepia");
-  // Add other effects as needed
-  JsonObject deviceInfoEffect = specialEffectConfig.createNestedObject("device");
-  deviceInfoEffect["identifiers"] = DEVICE_UNIQUE_ID;
-  String specialEffectConfigPayload;
-  serializeJson(specialEffectConfig, specialEffectConfigPayload);
-  client.publish(specialEffectConfigTopic.c_str(), specialEffectConfigPayload.c_str(), true);
 
   // Snapshot Button
   String snapshotButtonConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/button/" + DEVICE_NAME + "/snapshot/config";
@@ -1197,21 +1274,51 @@ void publishDiscoveryConfigs() {
   String looptimeSensorConfigPayload;
   serializeJson(looptimeSensorConfig, looptimeSensorConfigPayload);
   client.publish(looptimeSensorConfigTopic.c_str(), looptimeSensorConfigPayload.c_str(), true);
+
+  // Exposure Control Switch
+  String exposureControlConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/exposure_ctrl/config";
+  DynamicJsonDocument exposureControlConfig(512);
+  exposureControlConfig["name"] = "Exposure Control";
+  exposureControlConfig["command_topic"] = SET_EXPOSURE_CTRL_TOPIC;
+  exposureControlConfig["state_topic"] = EXPOSURE_CTRL_TOPIC;
+  exposureControlConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_exposure_ctrl";
+  exposureControlConfig["payload_on"] = "ON";
+  exposureControlConfig["payload_off"] = "OFF";
+  JsonObject deviceInfoExposureCtrl = exposureControlConfig.createNestedObject("device");
+  deviceInfoExposureCtrl["identifiers"] = DEVICE_UNIQUE_ID;
+  String exposureControlConfigPayload;
+  serializeJson(exposureControlConfig, exposureControlConfigPayload);
+  client.publish(exposureControlConfigTopic.c_str(), exposureControlConfigPayload.c_str(), true);
+
+  // AEC Value Number
+  String aecValueConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/aec_value/config";
+  DynamicJsonDocument aecValueConfig(512);
+  aecValueConfig["name"] = "AEC Value";
+  aecValueConfig["command_topic"] = SET_AEC_VALUE_TOPIC;
+  aecValueConfig["state_topic"] = AEC_VALUE_TOPIC;
+  aecValueConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_aec_value";
+  aecValueConfig["min"] = 0;
+  aecValueConfig["max"] = 1200;
+  aecValueConfig["step"] = 10;
+  JsonObject deviceInfoAecValue = aecValueConfig.createNestedObject("device");
+  deviceInfoAecValue["identifiers"] = DEVICE_UNIQUE_ID;
+  String aecValueConfigPayload;
+  serializeJson(aecValueConfig, aecValueConfigPayload);
+  client.publish(aecValueConfigTopic.c_str(), aecValueConfigPayload.c_str(), true);
 }
 
+// TODO: Inference handled on device. compare inference from device and from mqtt
 void handleInferenceTopic(String inferenceStr) {
-  client.publish(ROUNDTRIP_TOPIC, String(millis()-roundTripTimer).c_str(), true);
   if (inferenceStr == "not_cat"){
     /* code */
   } else if (inferenceStr == "cat_morris_entering") {
     handleCatLocationCommand("ON");
-    handleFlapStateCommand("ON");
   } else if (inferenceStr == "cat_morris_leaving") {
     handleCatLocationCommand("OFF");
   } else if (inferenceStr == "unknow_cat_entering") {
     /* code */
   } else if (inferenceStr == "prey") {
-    handleFlapStateCommand("OFF");
+    //handleFlapStateCommand("OFF");
   }
 }
 
@@ -1242,33 +1349,6 @@ void handleCatLocationCommand(String locationStr) {
   catLocation = locationStr.equalsIgnoreCase("ON");
   client.publish(CAT_LOCATION_TOPIC, catLocation ? "ON" : "OFF", true);
   mqttDebugPrintln("Cat location updated");
-}
-
-void handleFrameSizeCommand(String frameSizeStr) {
-  framesize_t newFrameSize;
-
-  if (frameSizeStr.equalsIgnoreCase("QQVGA")) {
-    newFrameSize = FRAMESIZE_QQVGA;
-  } else if (frameSizeStr.equalsIgnoreCase("QVGA")) {
-    newFrameSize = FRAMESIZE_QVGA;
-  } else if (frameSizeStr.equalsIgnoreCase("VGA")) {
-    newFrameSize = FRAMESIZE_VGA;
-  } else if (frameSizeStr.equalsIgnoreCase("SVGA")) {
-    newFrameSize = FRAMESIZE_SVGA;  
-  } else {
-    mqttDebugPrintln("Invalid frame size command");
-    return;
-  }
-
-  sensor_t * s = esp_camera_sensor_get();
-  if (s != NULL) {
-    s->set_framesize(s, newFrameSize);
-    mqttDebugPrintln("Frame size updated");
-    client.publish("catflap/frame_size", frameSizeStr.c_str(), true);
-    lastSettingsChangeTime = millis();
-  } else {
-    mqttDebugPrintln("Failed to get camera sensor");
-  }
 }
 
 void handleJpegQualityCommand(String qualityStr) {
@@ -1356,35 +1436,34 @@ void handleAWBCommand(String awbStateStr) {
   }
 }
 
-void handleSpecialEffectCommand(String effectStr) {
-  int effect;
-  if (effectStr.equalsIgnoreCase("No Effect")) {
-    effect = 0;
-  } else if (effectStr.equalsIgnoreCase("Negative")) {
-    effect = 1;
-  } else if (effectStr.equalsIgnoreCase("Grayscale")) {
-    effect = 2;
-  } else if (effectStr.equalsIgnoreCase("Red Tint")) {
-    effect = 3;
-  } else if (effectStr.equalsIgnoreCase("Green Tint")) {
-    effect = 4;
-  } else if (effectStr.equalsIgnoreCase("Blue Tint")) {
-    effect = 5;
-  } else if (effectStr.equalsIgnoreCase("Sepia")) {
-    effect = 6;
+void handleExposureCtrlCommand(String stateStr) {
+  bool enabled = stateStr.equalsIgnoreCase("ON");
+  sensor_t *s = esp_camera_sensor_get();
+  if (s != NULL) {
+      s->set_exposure_ctrl(s, enabled);
+      mqttDebugPrintln("Exposure control updated");
+      client.publish(EXPOSURE_CTRL_TOPIC, enabled ? "ON" : "OFF", true);
+      lastSettingsChangeTime = millis();
   } else {
-    mqttDebugPrintln("Invalid special effect");
-    return;
+      mqttDebugPrintln("Failed to get camera sensor");
+  }
+}
+
+void handleAECValueCommand(String aecStr) {
+  int aec = aecStr.toInt();
+  if (aec < 0 || aec > 1200) {
+      mqttDebugPrintln("Invalid AEC value (0-1200)");
+      return;
   }
 
-  sensor_t * s = esp_camera_sensor_get();
+  sensor_t *s = esp_camera_sensor_get();
   if (s != NULL) {
-    s->set_special_effect(s, effect);
-    mqttDebugPrintln("Special effect updated");
-    client.publish("catflap/special_effect", effectStr.c_str(), true);
-    lastSettingsChangeTime = millis();
+      s->set_aec_value(s, aec);
+      mqttDebugPrintln("AEC value updated");
+      client.publish(AEC_VALUE_TOPIC, String(aec).c_str(), true);
+      lastSettingsChangeTime = millis();
   } else {
-    mqttDebugPrintln("Failed to get camera sensor");
+      mqttDebugPrintln("Failed to get camera sensor");
   }
 }
 
@@ -1432,18 +1511,6 @@ void handleIRBarrierStateChange(bool barrierBroken) {
 void publishCameraSettings() {
   sensor_t * s = esp_camera_sensor_get();
   if (s != NULL) {
-    // Publish Frame Size
-    String frameSizeStr;
-    switch (s->status.framesize) {
-      case FRAMESIZE_QQVGA: frameSizeStr = "QQVGA"; break;
-      case FRAMESIZE_QVGA:  frameSizeStr = "QVGA";  break;
-      case FRAMESIZE_VGA:   frameSizeStr = "VGA";   break;
-      case FRAMESIZE_SVGA:   frameSizeStr = "SVGA";   break;
-      // Add other cases as needed
-      default: frameSizeStr = "UNKNOWN"; break;
-    }
-    client.publish("catflap/frame_size", frameSizeStr.c_str(), true);
-
     // Publish JPEG Quality
     int quality = s->status.quality;
     client.publish("catflap/jpeg_quality", String(quality).c_str(), true);
@@ -1463,22 +1530,6 @@ void publishCameraSettings() {
     // Publish AWB
     String awbState = s->status.awb ? "ON" : "OFF";
     client.publish("catflap/awb", awbState.c_str(), true);
-
-    // Publish Special Effect
-    String effectStr;
-    switch (s->status.special_effect) {
-      case 0: effectStr = "No Effect"; break;
-      case 1: effectStr = "Negative"; break;
-      case 2: effectStr = "Grayscale"; break;
-      case 3: effectStr = "Red Tint"; break;
-      case 4: effectStr = "Green Tint"; break;
-      case 5: effectStr = "Blue Tint"; break;
-      case 6: effectStr = "Sepia"; break;
-      default: effectStr = "Unknown"; break;
-    }
-    client.publish("catflap/special_effect", effectStr.c_str(), true);
-
-    // Publish other settings as needed
   }
 }
 
@@ -1617,129 +1668,132 @@ void setupOTA() {
 }
 
 void saveSettingsToEEPROM() {
-  mqttDebugPrintln("Saving settings to EEPROM...");
+    mqttDebugPrintln("Saving settings to EEPROM...");
 
-  // Save the version number
-  EEPROM.write(EEPROM_ADDRESS_VERSION, EEPROM_VERSION);
+    // Save the version number
+    EEPROM.write(EEPROM_ADDRESS_VERSION, EEPROM_VERSION);
+    EEPROM.write(EEPROM_ADDRESS_DETECTION_MODE, detectionModeEnabled ? 1 : 0);
+    EEPROM.write(EEPROM_ADDR_COOLDOWN, (int)(cooldownDuration * 10));
 
-  EEPROM.write(EEPROM_ADDRESS_DETECTION_MODE, detectionModeEnabled ? 1 : 0);
+    // Save camera settings
+    sensor_t * s = esp_camera_sensor_get();
+    if (s != NULL) {
+        EEPROM.write(EEPROM_ADDRESS_CAMERA_QUALITY, s->status.quality);
+        EEPROM.write(EEPROM_ADDRESS_CAMERA_BRIGHTNESS, s->status.brightness);
+        EEPROM.write(EEPROM_ADDRESS_CAMERA_CONTRAST, s->status.contrast);
+        EEPROM.write(EEPROM_ADDRESS_CAMERA_SATURATION, s->status.saturation);
+        EEPROM.write(EEPROM_ADDRESS_CAMERA_AWB, s->status.awb ? 1 : 0);
+        
+        // Save exposure control and AEC value
+        EEPROM.write(EEPROM_ADDRESS_CAMERA_EXPOSURE_CTRL, s->status.aec ? 1 : 0);
+        uint16_t aec_value = s->status.aec_value;
+        EEPROM.write(EEPROM_ADDRESS_CAMERA_AEC_VALUE, aec_value & 0xFF);
+        EEPROM.write(EEPROM_ADDRESS_CAMERA_AEC_VALUE + 1, (aec_value >> 8) & 0xFF);
+    }
 
-  // Save Cooldown Duration
-  EEPROM.write(EEPROM_ADDR_COOLDOWN, (int)(cooldownDuration * 10));
-
-  // Save camera settings
-  sensor_t * s = esp_camera_sensor_get();
-  if (s != NULL) {
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 0, s->status.framesize);
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 1, s->status.quality);
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 2, s->status.brightness);
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 3, s->status.contrast);
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 4, s->status.saturation);
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 5, s->status.awb ? 1 : 0);
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 6, s->status.special_effect);
-  }
-
-  EEPROM.commit();
+    EEPROM.commit();
+    mqttDebugPrintln("Settings saved to EEPROM");
 }
 
-
 void loadSettingsFromEEPROM() {
-  mqttDebugPrintln("Loading settings from EEPROM...");
+    mqttDebugPrintln("Loading settings from EEPROM...");
 
-  // Check EEPROM version
-  uint8_t storedVersion = EEPROM.read(EEPROM_ADDRESS_VERSION);
-  if (storedVersion != EEPROM_VERSION) {
-    mqttDebugPrintf("EEPROM version mismatch (found %d, expected %d). Initializing EEPROM...\n", storedVersion, EEPROM_VERSION);
-    initializeEEPROM();
-    return;
-  }
-
-  // Read and validate the Detection Mode setting
-  uint8_t detectionModeValue = EEPROM.read(EEPROM_ADDRESS_DETECTION_MODE);
-  if (detectionModeValue == 0 || detectionModeValue == 1) {
-    detectionModeEnabled = detectionModeValue == 1;
-  } else {
-    mqttDebugPrintln("Invalid detection mode in EEPROM. Setting to default (enabled).");
-    detectionModeEnabled = true;  // Default value
-  }
-
-  // Read and validate the Cooldown Duration
-  int cooldownValue = EEPROM.read(EEPROM_ADDR_COOLDOWN);
-  if (cooldownValue >= 0 && cooldownValue <= 50) {  // Valid range: 0 to 5.0 seconds (stored as integer with one decimal place)
-    cooldownDuration = cooldownValue / 10.0;  // Convert back to float
-  } else {
-    mqttDebugPrintln("Invalid cooldown value in EEPROM. Setting to default (0.0).");
-    cooldownDuration = 0.0;  // Default value
-  }
-
-  // Load and validate Camera Settings
-  sensor_t * s = esp_camera_sensor_get();
-  if (s != NULL) {
-    // Framesize
-    uint8_t framesizeValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 0);
-    if (framesizeValue >= FRAMESIZE_QQVGA && framesizeValue <= FRAMESIZE_UXGA) {
-      s->set_framesize(s, (framesize_t)framesizeValue);
-    } else {
-      mqttDebugPrintln("Invalid framesize in EEPROM. Setting to default (VGA).");
-      s->set_framesize(s, FRAMESIZE_VGA);  // Default value
+    // Check EEPROM version
+    uint8_t storedVersion = EEPROM.read(EEPROM_ADDRESS_VERSION);
+    if (storedVersion != EEPROM_VERSION) {
+        mqttDebugPrintf("EEPROM version mismatch (found %d, expected %d). Initializing EEPROM...\n", 
+                        storedVersion, EEPROM_VERSION);
+        initializeEEPROM();
+        return;
     }
 
-    // JPEG Quality
-    uint8_t qualityValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 1);
-    if (qualityValue >= 10 && qualityValue <= 63) {
-      s->set_quality(s, qualityValue);
+    // Read and validate the Detection Mode setting
+    uint8_t detectionModeValue = EEPROM.read(EEPROM_ADDRESS_DETECTION_MODE);
+    if (detectionModeValue == 0 || detectionModeValue == 1) {
+        detectionModeEnabled = detectionModeValue == 1;
     } else {
-      mqttDebugPrintln("Invalid JPEG quality in EEPROM. Setting to default (30).");
-      s->set_quality(s, 30);  // Default value
+        mqttDebugPrintln("Invalid detection mode in EEPROM. Setting to default (enabled).");
+        detectionModeEnabled = true;  // Default value
     }
 
-    // Brightness
-    int8_t brightnessValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 2);
-    if (brightnessValue >= -2 && brightnessValue <= 2) {
-      s->set_brightness(s, brightnessValue);
+    // Read and validate the Cooldown Duration
+    int cooldownValue = EEPROM.read(EEPROM_ADDR_COOLDOWN);
+    if (cooldownValue >= 0 && cooldownValue <= 50) {  // Valid range: 0 to 5.0 seconds
+        cooldownDuration = cooldownValue / 10.0;  // Convert back to float
     } else {
-      mqttDebugPrintln("Invalid brightness in EEPROM. Setting to default (0).");
-      s->set_brightness(s, 0);  // Default value
+        mqttDebugPrintln("Invalid cooldown value in EEPROM. Setting to default (0.0).");
+        cooldownDuration = 0.0;  // Default value
     }
 
-    // Contrast
-    int8_t contrastValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 3);
-    if (contrastValue >= -2 && contrastValue <= 2) {
-      s->set_contrast(s, contrastValue);
-    } else {
-      mqttDebugPrintln("Invalid contrast in EEPROM. Setting to default (0).");
-      s->set_contrast(s, 0);  // Default value
-    }
+    // Load and validate Camera Settings
+    sensor_t * s = esp_camera_sensor_get();
+    if (s != NULL) {
+        // JPEG Quality
+        uint8_t qualityValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_QUALITY);
+        if (qualityValue >= 10 && qualityValue <= 63) {
+            s->set_quality(s, qualityValue);
+        } else {
+            mqttDebugPrintln("Invalid JPEG quality in EEPROM. Setting to default (30).");
+            s->set_quality(s, 30);
+        }
 
-    // Saturation
-    int8_t saturationValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 4);
-    if (saturationValue >= -2 && saturationValue <= 2) {
-      s->set_saturation(s, saturationValue);
-    } else {
-      mqttDebugPrintln("Invalid saturation in EEPROM. Setting to default (0).");
-      s->set_saturation(s, 0);  // Default value
-    }
+        // Brightness
+        int8_t brightnessValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_BRIGHTNESS);
+        if (brightnessValue >= -2 && brightnessValue <= 2) {
+            s->set_brightness(s, brightnessValue);
+        } else {
+            mqttDebugPrintln("Invalid brightness in EEPROM. Setting to default (0).");
+            s->set_brightness(s, 0);
+        }
 
-    // Automatic White Balance (AWB)
-    uint8_t awbValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 5);
-    if (awbValue == 0 || awbValue == 1) {
-      s->set_whitebal(s, awbValue == 1);
-    } else {
-      mqttDebugPrintln("Invalid AWB value in EEPROM. Setting to default (enabled).");
-      s->set_whitebal(s, true);  // Default value
-    }
+        // Contrast
+        int8_t contrastValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_CONTRAST);
+        if (contrastValue >= -2 && contrastValue <= 2) {
+            s->set_contrast(s, contrastValue);
+        } else {
+            mqttDebugPrintln("Invalid contrast in EEPROM. Setting to default (0).");
+            s->set_contrast(s, 0);
+        }
 
-    // Special Effect
-    uint8_t effectValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 6);
-    if (effectValue >= 0 && effectValue <= 6) {
-      s->set_special_effect(s, effectValue);
-    } else {
-      mqttDebugPrintln("Invalid special effect in EEPROM. Setting to default (No Effect).");
-      s->set_special_effect(s, 0);  // Default value
-    }
+        // Saturation
+        int8_t saturationValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_SATURATION);
+        if (saturationValue >= -2 && saturationValue <= 2) {
+            s->set_saturation(s, saturationValue);
+        } else {
+            mqttDebugPrintln("Invalid saturation in EEPROM. Setting to default (0).");
+            s->set_saturation(s, 0);
+        }
 
-    mqttDebugPrintln("Camera settings loaded from EEPROM.");
-  } else {
-    mqttDebugPrintln("Failed to get camera sensor. Cannot load camera settings from EEPROM.");
-  }
+        // Automatic White Balance (AWB)
+        uint8_t awbValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_AWB);
+        if (awbValue <= 1) {
+            s->set_whitebal(s, awbValue == 1);
+        } else {
+            mqttDebugPrintln("Invalid AWB value in EEPROM. Setting to default (enabled).");
+            s->set_whitebal(s, true);
+        }
+
+        // Exposure Control
+        uint8_t exposureCtrlValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_EXPOSURE_CTRL);
+        if (exposureCtrlValue <= 1) {
+            s->set_exposure_ctrl(s, exposureCtrlValue == 1);
+        } else {
+            mqttDebugPrintln("Invalid exposure control in EEPROM. Setting to default (enabled).");
+            s->set_exposure_ctrl(s, true);
+        }
+
+        // AEC Value (16-bit)
+        uint16_t aecValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_AEC_VALUE) | 
+                           (EEPROM.read(EEPROM_ADDRESS_CAMERA_AEC_VALUE + 1) << 8);
+        if (aecValue <= 1200) {
+            s->set_aec_value(s, aecValue);
+        } else {
+            mqttDebugPrintln("Invalid AEC value in EEPROM. Setting to default (400).");
+            s->set_aec_value(s, 400);
+        }
+
+        mqttDebugPrintln("Camera settings loaded from EEPROM.");
+    } else {
+        mqttDebugPrintln("Failed to get camera sensor. Cannot load camera settings from EEPROM.");
+    }
 }
