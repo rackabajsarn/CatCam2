@@ -8,6 +8,7 @@
 #include <EEPROM.h>
 #include "esp_system.h" // This is needed to use esp_reset_reason()
 #include "secrets.h"
+//#include "model_handler.h"
 #include "esp_wifi.h"
 #include "esp_heap_caps.h"
 #include <ArduTFLite.h>
@@ -51,6 +52,8 @@ const char* password = WIFI_PASSWORD;
 #define SET_CONTRAST_TOPIC "catflap/contrast/set"
 #define SET_SATURATION_TOPIC "catflap/saturation/set"
 #define SET_AWB_TOPIC "catflap/awb/set"
+#define MODEL_SOURCE_TOPIC "catflap/model_source"
+#define SET_MODEL_SOURCE_TOPIC "catflap/model_source/set"
 
 // Device information
 #define DEVICE_NAME "catflap"
@@ -119,6 +122,10 @@ void processCroppedAndConvert(camera_fb_t *cropped);
 unsigned int jpgOutputCallback(void *arg, size_t index, const void *data, size_t len);
 camera_fb_t* cropImage(camera_fb_t *fb);
 camera_fb_t* resizeImage(camera_fb_t *cropped, int originalSize, int targetSize);
+camera_fb_t* cropFrame(camera_fb_t *fb);
+camera_fb_t* resizeFrame(camera_fb_t *cropped);
+bool setupInference();
+bool loadModelFromSD(const char* path, uint8_t** model_data, size_t* model_size);
 void enableFlap();
 void disableFlap();
 void handleMqttMessages(char* topic, byte* payload, unsigned int length);
@@ -153,6 +160,7 @@ void handleFlapStateCommand(String stateStr);
 void updateIRBarrierState();
 bool isEEPROMInitialized();
 void initializeEEPROM();
+void handleModelSourceCommand(String stateStr);
 
 // Add more handler functions as needed
 
@@ -167,6 +175,7 @@ bool mqttDebugEnabled = true;
 bool catLocation = true; // true = home
 bool barrierTriggered = false;  // Flag to indicate barrier has been triggered
 bool barrierStableState = false; // Last confirmed stable state (false = not broken, true = broken)
+bool useLocalModel = true;  // Default to local model.cc when no SD card
 
 // Timer for saving settings
 unsigned long lastSettingsChangeTime = 0;
@@ -210,18 +219,27 @@ void setup() {
   Serial.begin(115200);
   delay(1000);  // Wait for Serial
   
-  // Initialize SD card (using SPI, adjust SS pin if needed).
+  // Initialize SD card but don't fail if not present
   if (!SD.begin()) {
-    Serial.println("SD card initialization failed");
-    while (true) { delay(1000); }
+    mqttDebugPrintln("SD card initialization failed - using local model");
+    useLocalModel = true;
   }
-  Serial.println("SD card initialized");
   
-  // Load the model from the SD card.
-  if (!loadModelFromSD("/model.tflite", &g_model_data, &g_model_size)) {
-    Serial.println("Model loading failed");
-    while (true) { delay(1000); }
+  // Load the appropriate model
+  if (!useLocalModel) {
+    // Load from SD card
+    if (!loadModelFromSD("/model.tflite", &g_model_data, &g_model_size)) {
+      mqttDebugPrintln("Model loading from SD failed - falling back to local model");
+      useLocalModel = true;
+    }
   }
+  
+  if (useLocalModel) {
+    // Use the model from model.cc
+    g_model_data = my_model_quant_tflite;
+    g_model_size = my_model_quant_tflite_len;
+  }
+  
   initCamera();
 
   // Initialize EEPROM
@@ -422,6 +440,7 @@ void mqttSubscribe() {
     client.subscribe(SET_COOLDOWN_TOPIC);
     client.subscribe(SET_FLAP_STATE_TOPIC);
     client.subscribe(SET_CAT_LOCATION_TOPIC);
+    client.subscribe(SET_MODEL_SOURCE_TOPIC);
 }
 
 void mqttInitialPublish() {
@@ -558,7 +577,7 @@ bool setupInference() {
   if (model->version() != TFLITE_SCHEMA_VERSION) {
     Serial.printf("Model schema version (%d) does not match TFLite Micro schema version (%d).\n",
                   model->version(), TFLITE_SCHEMA_VERSION);
-    return;
+    return false;
   }
   
   // Create an op resolver.
@@ -572,7 +591,7 @@ bool setupInference() {
   TfLiteStatus allocate_status = interpreter->AllocateTensors();
   if (allocate_status != kTfLiteOk) {
     Serial.println("AllocateTensors() failed");
-    return;
+    return false;
   }
   
   Serial.println("Inference setup complete.");
@@ -863,6 +882,8 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
     handleExposureCtrlCommand(incomingMessage);
   } else if (String(topic) == SET_AEC_VALUE_TOPIC) {
     handleAECValueCommand(incomingMessage);
+  } else if (String(topic) == SET_MODEL_SOURCE_TOPIC) {
+    handleModelSourceCommand(incomingMessage);
   } else {
     mqttDebugPrintln("unknown topic");
   }
@@ -1305,6 +1326,21 @@ void publishDiscoveryConfigs() {
   String aecValueConfigPayload;
   serializeJson(aecValueConfig, aecValueConfigPayload);
   client.publish(aecValueConfigTopic.c_str(), aecValueConfigPayload.c_str(), true);
+
+  // Model Source Switch
+  String modelSourceConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/model_source/config";
+  DynamicJsonDocument modelSourceConfig(512);
+  modelSourceConfig["name"] = "Use SD Card Model";
+  modelSourceConfig["command_topic"] = SET_MODEL_SOURCE_TOPIC;
+  modelSourceConfig["state_topic"] = MODEL_SOURCE_TOPIC;
+  modelSourceConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_model_source";
+  modelSourceConfig["payload_on"] = "ON";
+  modelSourceConfig["payload_off"] = "OFF";
+  JsonObject deviceInfoModelSource = modelSourceConfig.createNestedObject("device");
+  deviceInfoModelSource["identifiers"] = DEVICE_UNIQUE_ID;
+  String modelSourceConfigPayload;
+  serializeJson(modelSourceConfig, modelSourceConfigPayload);
+  client.publish(modelSourceConfigTopic.c_str(), modelSourceConfigPayload.c_str(), true);
 }
 
 // TODO: Inference handled on device. compare inference from device and from mqtt
@@ -1796,4 +1832,28 @@ void loadSettingsFromEEPROM() {
     } else {
         mqttDebugPrintln("Failed to get camera sensor. Cannot load camera settings from EEPROM.");
     }
+}
+
+void handleModelSourceCommand(String stateStr) {
+    bool newState = stateStr.equalsIgnoreCase("ON");
+    if (newState && !SD.begin()) {
+        mqttDebugPrintln("Cannot switch to SD card model: No SD card found");
+        client.publish(MODEL_SOURCE_TOPIC, "OFF", true);
+        return;
+    }
+    useLocalModel = !newState;
+    client.publish(MODEL_SOURCE_TOPIC, newState ? "ON" : "OFF", true);
+    mqttDebugPrintln(useLocalModel ? "Using local model" : "Using SD card model");
+    
+    // Reinitialize the model
+    if (!useLocalModel) {
+      if (!loadModelFromSD("/model.tflite", &g_model_data, &g_model_size)) {
+          mqttDebugPrintln("Model loading from SD failed - falling back to local model");
+          useLocalModel = true;
+          client.publish(MODEL_SOURCE_TOPIC, "OFF", true);
+      }
+  } else {
+      g_model_data = my_model_quant_tflite;
+      g_model_size = my_model_quant_tflite_len;
+  }
 }
