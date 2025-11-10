@@ -211,36 +211,76 @@ uint8_t tensor_arena[kTensorArenaSize];
 const tflite::Model* model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
 
-// Global pointer to hold the dynamically loaded model.
-uint8_t* g_model_data = nullptr;
+// Global pointer to the active model (embedded flash or owned heap).
+const uint8_t* g_model_data = nullptr;
 size_t g_model_size = 0;
+// If non-null, this holds a heap/PSRAM-allocated model we own and must free on switch.
+static uint8_t* g_owned_heap_model = nullptr;
+
+
+// -------- Model ownership helpers (safe switching between embedded and SD) --------
+static void freeOwnedModel()
+{
+  if (g_owned_heap_model) {
+    heap_caps_free(g_owned_heap_model);
+    g_owned_heap_model = nullptr;
+  }
+}
+
+static void adoptEmbeddedModel()
+{
+  freeOwnedModel();
+  g_model_data = my_model_quant_tflite;
+  g_model_size = my_model_quant_tflite_len;
+  useLocalModel = true;
+}
+
+static bool adoptFileModel(const char* path)
+{
+  uint8_t* buf = nullptr;
+  size_t sz = 0;
+  if (!loadModelFromSD(path, &buf, &sz)) {
+    return false;
+  }
+  // Minimal FlatBuffer sanity: "TFL3" at bytes 4..7
+  if (!(sz >= 8 && buf[4]=='T' && buf[5]=='F' && buf[6]=='L' && buf[7]=='3')) {
+    heap_caps_free(buf);
+    return false;
+  }
+
+  freeOwnedModel();
+  g_owned_heap_model = buf;
+  g_model_data = buf;   // const pointer to owned heap
+  g_model_size = sz;
+  useLocalModel = false;
+  return true;
+}
+// -------------------------------------------------------------------------------
 
 void setup() {
   Serial.begin(115200);
   delay(1000);  // Wait for Serial
   
   // Initialize SD card but don't fail if not present
-  if (!SD.begin()) {
-    mqttDebugPrintln("SD card initialization failed - using local model");
-    useLocalModel = true;
+if (!SD.begin()) {
+  mqttDebugPrintln("SD card initialization failed - using embedded model");
+  useLocalModel = true;
+}
+
+// Select model based on flag
+if (!useLocalModel) {
+  if (!adoptFileModel("/model.tflite")) {
+    mqttDebugPrintln("Model loading from SD failed - falling back to embedded model");
+    adoptEmbeddedModel();
+  } else {
+    mqttDebugPrintln("Using SD card model");
   }
-  
-  // Load the appropriate model
-  if (!useLocalModel) {
-    // Load from SD card
-    if (!loadModelFromSD("/model.tflite", &g_model_data, &g_model_size)) {
-      mqttDebugPrintln("Model loading from SD failed - falling back to local model");
-      useLocalModel = true;
-    }
-  }
-  
-  if (useLocalModel) {
-    // Use the model from model.cc
-    g_model_data = my_model_quant_tflite;
-    g_model_size = my_model_quant_tflite_len;
-  }
-  
-  initCamera();
+} else {
+  adoptEmbeddedModel();
+  mqttDebugPrintln("Using embedded model");
+}
+
+initCamera();
 
   // Initialize EEPROM
   EEPROM.begin(EEPROM_SIZE);
@@ -550,22 +590,15 @@ bool updateModelFromSD() {
 }
 
 void reloadModel() {
-  // Free the current model data if allocated.
-  if (g_model_data) {
-    heap_caps_free(g_model_data);
-    g_model_data = nullptr;
-  }
-  
-  // Load the new model from SD.
-  if (loadModelFromSD("/model.tflite", &g_model_data, &g_model_size)) {
-    // Reinitialize the TFLite Micro interpreter with the new model.
-    if (!setupInference()) {
-      Serial.println("Failed to reinitialize inference with the new model");
-    } else {
-      Serial.println("New model loaded and interpreter reinitialized.");
-    }
-  } else {
+  // Reload from SD and reinitialize interpreter
+  if (!adoptFileModel("/model.tflite")) {
     Serial.println("Failed to load the new model from SD");
+    return;
+  }
+  if (!setupInference()) {
+    Serial.println("Failed to reinitialize inference with the new model");
+  } else {
+    Serial.println("New model loaded and interpreter reinitialized.");
   }
 }
 
@@ -1835,25 +1868,30 @@ void loadSettingsFromEEPROM() {
 }
 
 void handleModelSourceCommand(String stateStr) {
-    bool newState = stateStr.equalsIgnoreCase("ON");
-    if (newState && !SD.begin()) {
-        mqttDebugPrintln("Cannot switch to SD card model: No SD card found");
+    bool wantSD = stateStr.equalsIgnoreCase("ON");
+
+    if (wantSD) {
+        if (!SD.begin()) {
+            mqttDebugPrintln("Cannot switch to SD card model: No SD card found");
+            client.publish(MODEL_SOURCE_TOPIC, "OFF", true);
+            return;
+        }
+        if (!adoptFileModel("/model.tflite")) {
+            mqttDebugPrintln("Model loading from SD failed - staying on embedded model");
+            adoptEmbeddedModel();
+            client.publish(MODEL_SOURCE_TOPIC, "OFF", true);
+        } else {
+            client.publish(MODEL_SOURCE_TOPIC, "ON", true);
+            mqttDebugPrintln("Using SD card model");
+        }
+    } else {
+        adoptEmbeddedModel();
         client.publish(MODEL_SOURCE_TOPIC, "OFF", true);
-        return;
+        mqttDebugPrintln("Using embedded model");
     }
-    useLocalModel = !newState;
-    client.publish(MODEL_SOURCE_TOPIC, newState ? "ON" : "OFF", true);
-    mqttDebugPrintln(useLocalModel ? "Using local model" : "Using SD card model");
-    
-    // Reinitialize the model
-    if (!useLocalModel) {
-      if (!loadModelFromSD("/model.tflite", &g_model_data, &g_model_size)) {
-          mqttDebugPrintln("Model loading from SD failed - falling back to local model");
-          useLocalModel = true;
-          client.publish(MODEL_SOURCE_TOPIC, "OFF", true);
-      }
-  } else {
-      g_model_data = my_model_quant_tflite;
-      g_model_size = my_model_quant_tflite_len;
-  }
+
+    // Reinitialize the interpreter with the new model
+    if (!setupInference()) {
+        mqttDebugPrintln("Failed to reinitialize inference after model switch");
+    }
 }

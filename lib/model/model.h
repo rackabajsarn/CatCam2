@@ -1,15 +1,8 @@
 #ifndef MODEL_H
 #define MODEL_H
+#include <stdint.h>
 
-#ifdef __cplusplus
-extern "C" {
+extern const uint8_t  my_model_quant_tflite[];
+extern const uint32_t my_model_quant_tflite_len;
+
 #endif
-
-extern unsigned char my_model_quant_tflite[];
-extern unsigned int my_model_quant_tflite_len;
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif // MODEL_H
