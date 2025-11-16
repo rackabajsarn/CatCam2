@@ -15,7 +15,13 @@
 #include "model.h"
 #include <SD.h>
 #include <SPI.h>
-
+#include <ESPAsyncWebServer.h>
+#include <Update.h>
+// TensorFlow Lite Micro headers
+#include "tensorflow/lite/micro/all_ops_resolver.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+//#include "tensorflow/lite/version.h"
 
 // Wi-Fi credentials from secrets.h
 const char* ssid = WIFI_SSID;
@@ -54,6 +60,9 @@ const char* password = WIFI_PASSWORD;
 #define SET_AWB_TOPIC "catflap/awb/set"
 #define MODEL_SOURCE_TOPIC "catflap/model_source"
 #define SET_MODEL_SOURCE_TOPIC "catflap/model_source/set"
+#define ESP32_INFERENCE_TOPIC "catflap/esp32_inference"
+#define SERVER_INFERENCE_TOPIC "catflap/server_inference"
+#define INFERENCE_COMPARISON_TOPIC "catflap/inference_comparison"
 
 // Device information
 #define DEVICE_NAME "catflap"
@@ -130,6 +139,7 @@ void enableFlap();
 void disableFlap();
 void handleMqttMessages(char* topic, byte* payload, unsigned int length);
 void setupOTA();
+void setupWebServer();
 void publishDiscoveryConfigs();
 void publishCooldownState();
 void publishDiagnostics();
@@ -141,6 +151,7 @@ void mqttDebugPrint(const char* message);
 void mqttDebugPrintln(const char* message);
 void mqttDebugPrintf(const char* format, ...);
 void handleInferenceTopic(String inferenceStr);
+void handleServerInference(String serverInferenceStr);
 void handleJpegQualityCommand(String qualityStr);
 void publishCameraSettings();
 void handleBrightnessCommand(String brightnessStr);
@@ -166,6 +177,7 @@ void handleModelSourceCommand(String stateStr);
 
 WiFiClient espClient;
 PubSubClient client(espClient);
+AsyncWebServer server(80);  // HTTP server for model uploads
 
 // Global variables
 int lastIRState = HIGH;
@@ -176,6 +188,13 @@ bool catLocation = true; // true = home
 bool barrierTriggered = false;  // Flag to indicate barrier has been triggered
 bool barrierStableState = false; // Last confirmed stable state (false = not broken, true = broken)
 bool useLocalModel = true;  // Default to local model.cc when no SD card
+
+// Model comparison tracking
+String lastESP32Inference = "";
+String lastServerInference = "";
+unsigned long totalInferences = 0;
+unsigned long inferenceMatches = 0;
+unsigned long inferenceMismatches = 0;
 
 // Timer for saving settings
 unsigned long lastSettingsChangeTime = 0;
@@ -307,6 +326,7 @@ initCamera();
   mqttConnect();
 
   setupOTA();  // Initialize OTA
+  setupWebServer();  // Initialize HTTP server for model uploads
   checkResetReason();
   publishIPState();
 
@@ -464,6 +484,7 @@ void mqttSubscribe() {
     // System commands
     client.subscribe(COMMAND_TOPIC);
     client.subscribe(INFERENCE_TOPIC);
+    client.subscribe(SERVER_INFERENCE_TOPIC);  // Subscribe to server inference results
 
     // Camera settings
     client.subscribe(SET_JPEG_QUALITY_TOPIC);
@@ -728,7 +749,6 @@ void captureAndSendImage() {
   if (!fb) {
     Serial.println("Camera capture failed");
     mqttDebugPrintln("Camera capture failed");
-
     return;
   }
   
@@ -739,46 +759,51 @@ void captureAndSendImage() {
       return;
   }
 
-  // Resize the cropped image to 96x96.
+  // Resize the cropped image to 96x96 for ESP32 inference.
   camera_fb_t *resized = resizeFrame(cropped);
   if (!resized) {
       esp_camera_fb_return(fb);
       return;
   }
 
-  // For demonstration purposes, let's create a dummy input.
-  static uint8_t processed_img[96 * 96] = {0};
-  // Fill processed_img with dummy data if needed.
+  // Copy resized data to input buffer for inference
+  // The resized image should already be grayscale 96x96
+  memcpy((void*)resized->buf, (const void*)resized->buf, 96 * 96);
   
-  // Run inference on the processed image. 
-  // TODO: Handling of closing hatch. If working good, normally locked?
-  if(run_inference(processed_img, sizeof(processed_img)))
-  {
+  // Run LOCAL ESP32 inference on 96x96 image for prey/not_prey
+  bool esp32PreyDetected = run_inference(resized->buf, 96 * 96);
+  
+  // Publish ESP32 inference result
+  String esp32Result = esp32PreyDetected ? "prey" : "not_prey";
+  lastESP32Inference = esp32Result;
+  client.publish(ESP32_INFERENCE_TOPIC, esp32Result.c_str(), false);
+  
+  // Make flap decision based on LOCAL inference
+  if (esp32PreyDetected) {
     handleFlapStateCommand("OFF");
-    client.publish(INFERENCE_TOPIC, "Prey detected", true);
-  }
-  else
-  {
+    mqttDebugPrintln("ESP32: Prey detected - closing flap");
+  } else {
     handleFlapStateCommand("ON");
-  }  
-  client.publish(ROUNDTRIP_TOPIC, String(millis()-roundTripTimer).c_str(), true);
-
+    mqttDebugPrintln("ESP32: No prey - opening flap");
+  }
+  
   // Free the resized frame's buffer and struct.
   if (resized->buf) heap_caps_free(resized->buf);
   heap_caps_free(resized);
 
+  // Convert cropped 384x384 to JPEG for sending to server
   processCroppedAndConvert(cropped);
 
-  // Publish the image over MQTT
+  // Publish the 384x384 image to server via MQTT for detailed inference
   if (client.connected()) {
-    if (client.publish(IMAGE_TOPIC, cropped->buf, cropped->len, true))
-    {
-      mqttDebugPrintln("Image sent via mqtt");
+    if (client.publish(IMAGE_TOPIC, cropped->buf, cropped->len, true)) {
+      mqttDebugPrintln("Image sent to server for inference");
     } else {
-      mqttDebugPrintln("Image failed to send via mqtt");
+      mqttDebugPrintln("Failed to send image to server");
     }
   }
-
+  
+  client.publish(ROUNDTRIP_TOPIC, String(millis()-roundTripTimer).c_str(), true);
   esp_camera_fb_return(fb);
 }
 
@@ -909,6 +934,8 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
     handleCooldownCommand(incomingMessage);
   } else if (String(topic) == INFERENCE_TOPIC) {
     handleInferenceTopic(incomingMessage);
+  } else if (String(topic) == SERVER_INFERENCE_TOPIC) {
+    handleServerInference(incomingMessage);
   } else if (String(topic) == SET_CAT_LOCATION_TOPIC) {
     handleCatLocationCommand(incomingMessage);
   } else if (String(topic) == SET_EXPOSURE_CTRL_TOPIC) {
@@ -1391,6 +1418,29 @@ void handleInferenceTopic(String inferenceStr) {
   }
 }
 
+void handleServerInference(String serverInferenceStr) {
+  // Server sends simplified result: "prey" or "not_prey"
+  lastServerInference = serverInferenceStr;
+  totalInferences++;
+  
+  // Compare ESP32 and Server results
+  if (lastESP32Inference == lastServerInference) {
+    inferenceMatches++;
+    mqttDebugPrintf("Inference match: %s\n", lastESP32Inference.c_str());
+  } else {
+    inferenceMismatches++;
+    mqttDebugPrintf("Inference mismatch! ESP32: %s, Server: %s\n", 
+                    lastESP32Inference.c_str(), lastServerInference.c_str());
+  }
+  
+  // Publish comparison stats
+  float accuracy = totalInferences > 0 ? (float)inferenceMatches / totalInferences * 100.0 : 0.0;
+  String comparisonMsg = String("Matches: ") + inferenceMatches + 
+                        " / " + totalInferences + 
+                        " (" + String(accuracy, 1) + "%)";
+  client.publish(INFERENCE_COMPARISON_TOPIC, comparisonMsg.c_str(), true);
+}
+
 void handleDetectionModeCommand(String stateStr) {
   bool newState = stateStr.equalsIgnoreCase("ON");
   detectionModeEnabled = newState;
@@ -1734,6 +1784,114 @@ void setupOTA() {
   Serial.println("OTA Ready");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
+}
+
+void setupWebServer() {
+  // Model upload endpoint
+  server.on("/upload", HTTP_POST, 
+    [](AsyncWebServerRequest *request) {
+      // Response is sent in onUpload handler
+    },
+    [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+      static File uploadFile;
+      static String tempPath = "/model_temp.tflite";
+      static size_t totalSize = 0;
+      
+      if (index == 0) {
+        // Start of upload
+        mqttDebugPrintln("Starting model upload...");
+        totalSize = 0;
+        
+        if (!SD.begin()) {
+          mqttDebugPrintln("SD card not available for upload");
+          request->send(500, "text/plain", "SD card not available");
+          return;
+        }
+        
+        // Open temp file for writing
+        uploadFile = SD.open(tempPath, FILE_WRITE);
+        if (!uploadFile) {
+          mqttDebugPrintln("Failed to create temp model file");
+          request->send(500, "text/plain", "Failed to create temp file");
+          return;
+        }
+      }
+      
+      // Write chunk
+      if (uploadFile) {
+        uploadFile.write(data, len);
+        totalSize += len;
+      }
+      
+      if (final) {
+        // End of upload
+        uploadFile.close();
+        mqttDebugPrintf("Model upload complete: %d bytes\n", totalSize);
+        
+        // Validate the model file
+        File modelFile = SD.open(tempPath, FILE_READ);
+        if (!modelFile) {
+          mqttDebugPrintln("Failed to open uploaded model for validation");
+          request->send(500, "text/plain", "Upload failed - validation error");
+          SD.remove(tempPath);
+          return;
+        }
+        
+        // Check size
+        size_t fileSize = modelFile.size();
+        if (fileSize < 1000 || fileSize > 2 * 1024 * 1024) {  // Between 1KB and 2MB
+          mqttDebugPrintf("Invalid model size: %d bytes\n", fileSize);
+          modelFile.close();
+          SD.remove(tempPath);
+          request->send(400, "text/plain", "Invalid model size");
+          return;
+        }
+        
+        // Check TFLite magic bytes (first 4 bytes should indicate FlatBuffer)
+        uint8_t header[8];
+        modelFile.read(header, 8);
+        modelFile.close();
+        
+        // TFLite files have "TFL3" at offset 4-7
+        if (!(header[4] == 'T' && header[5] == 'F' && header[6] == 'L' && header[7] == '3')) {
+          mqttDebugPrintln("Invalid TFLite model format");
+          SD.remove(tempPath);
+          request->send(400, "text/plain", "Invalid TFLite format");
+          return;
+        }
+        
+        // Model is valid, replace the old one
+        if (SD.exists("/model.tflite")) {
+          SD.remove("/model.tflite");
+        }
+        SD.rename(tempPath, "/model.tflite");
+        
+        mqttDebugPrintln("New model installed successfully!");
+        client.publish(DEBUG_TOPIC, "New model uploaded and validated", false);
+        
+        // Optionally reload the model if using SD card model
+        if (!useLocalModel) {
+          // Trigger model reload
+          handleModelSourceCommand("ON");
+        }
+        
+        request->send(200, "text/plain", "Model uploaded successfully");
+      }
+    }
+  );
+  
+  // Simple health check endpoint
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String status = "OK";
+    status += "\nModel: " + String(useLocalModel ? "Embedded" : "SD Card");
+    status += "\nFree Heap: " + String(ESP.getFreeHeap());
+    status += "\nUptime: " + String(millis() / 1000) + "s";
+    request->send(200, "text/plain", status);
+  });
+  
+  server.begin();
+  mqttDebugPrintln("HTTP server started");
+  Serial.println("HTTP server started on port 80");
 }
 
 void saveSettingsToEEPROM() {
