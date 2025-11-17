@@ -52,9 +52,16 @@ const char* password = WIFI_PASSWORD;
 #define EEPROM_ADDRESS_CAMERA_SETTINGS 3  // Starting address for camera settings
 
 // GPIO Definitions
-#define IR_PIN          32
+#define IR_PIN 32
 //#define OPEN_SENSOR_PIN 32
 #define ENABLE_FLAP_PIN 33 //TODO: Double check 13 or 14
+#define IR_PWM_PIN 14
+#define IR_PWM_CH  2
+#define IR_FREQ    38000
+#define IR_DUTY    64
+#define IR_DEBOUNCE_MS       10        // time input must stay stable
+#define IR_MIN_HOLD_MS       120       // rate-limit chatter (optional)
+//#define IR_SEEN_WINDOW_US    1500   // Beam is 'OK' if a LOW edge was seen in last 3 ms
 
 // Camera pin configuration
 #define PWDN_GPIO_NUM    -1
@@ -76,13 +83,18 @@ const char* password = WIFI_PASSWORD;
 #define PCLK_GPIO_NUM    22
 
 // Forward declarations of functions
+void IRAM_ATTR ir_falling_isr();
 void checkResetReason();
+void ir_init();
+void ir_on();
+void ir_off();
+void ir_burst();
 void setup_wifi();
 void mqttConnect();
 void mqttReconnect();
 void mqttSubscribe();
 void mqttInitialPublish();
-void initCamera();
+bool initCamera();
 void captureAndSendImage();
 void enableFlap();
 void disableFlap();
@@ -124,7 +136,6 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 
 // Global variables
-int lastIRState = HIGH;
 bool flapEnabled = true;  // Initialize flap state
 bool detectionModeEnabled = true;
 bool mqttDebugEnabled = true;
@@ -147,18 +158,25 @@ unsigned long loopCount = 0;
 unsigned long roundTripTimer = 0;
 
 // Debounce and Cooldown Settings
-#define DEBOUNCE_DURATION_MS 30  // Debounce duration in milliseconds
 float cooldownDuration = 0.0;    // Cooldown duration in seconds (default to 0)
 unsigned long lastTriggerTime = 0;     // Timestamp of the last valid trigger
-unsigned long debounceStartTime = 0;   // Timestamp when debounce started
-bool debounceActive = false;           // Flag to indicate debounce is in progress
+unsigned long lastIrDebug = 0;
+
+enum IrState : uint8_t { IR_CLEAR=0, IR_BROKEN=1 };  // CLEAR = beam received
+static IrState g_stable = IR_CLEAR;
+static IrState g_candidate = IR_CLEAR;
+static uint32_t g_lastChangeMs = 0;      // when candidate changed
+static uint32_t g_lastStableMs = 0;      // last time we committed a stable change
+static bool g_irSensingEnabled = true;   // mask while IR is intentionally off
+static volatile uint32_t g_pulseCount = 0;    // count IR pulses for robust detection
+static uint32_t g_lastPulseCheckMs = 0;       // last time we checked pulse count
 
 
 void setup() {
   Serial.begin(115200);
 
-  initCamera();
-
+  bool cameraInitialized = initCamera();
+  
   // Initialize EEPROM
   EEPROM.begin(EEPROM_SIZE);
   if (!isEEPROMInitialized()) {
@@ -168,9 +186,14 @@ void setup() {
   }
 
   // Initialize GPIOs
-  pinMode(IR_PIN, INPUT);
+  pinMode(IR_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(IR_PIN), ir_falling_isr, FALLING);
+  g_pulseCount = 0;
+  g_lastPulseCheckMs = millis();
   //pinMode(OPEN_SENSOR_PIN, INPUT);
   pinMode(ENABLE_FLAP_PIN, OUTPUT);
+  ir_init();
+  ir_on(); // Start IR immediately so we can get readings
 
   setup_wifi();
     // Disable Wi-Fi power save mode
@@ -179,6 +202,7 @@ void setup() {
   // Initialize MQTT
   client.setServer(MQTT_SERVER, 1883);
   client.setCallback(handleMqttMessages);
+
   client.setBufferSize(MQTT_MAX_PACKET_SIZE);
     
   mqttConnect();
@@ -187,6 +211,11 @@ void setup() {
   checkResetReason();
   publishIPState();
   mqttDebugPrintln("ESP Setup finished");
+  if (!cameraInitialized)
+  {
+    mqttDebugPrintln("Camera setup failed");
+  }
+  
 }
 
 void loop() {
@@ -203,7 +232,7 @@ void loop() {
 
   // Handle OTA updates
   ArduinoOTA.handle();
-
+  
   // Handle IR barrier state
   updateIRBarrierState();
 
@@ -215,7 +244,76 @@ void loop() {
 
   publishDiagnostics();
   //delay(10);  // Small delay to prevent watchdog resets
+  
+  // IR transmitter burst handling
+  ir_burst();
+
+
+
+// In loop(), near the end:
+// if (millis() - lastIrDebug > 1000) {
+//   lastIrDebug = millis();
+//   uint32_t nowUs = micros();
+//   bool beam_ok = (nowUs - g_lastIrLowUs) < IR_SEEN_WINDOW_US;
+//   int raw = digitalRead(IR_PIN);
+//   mqttDebugPrintf("IR debug: raw=%d, beam_ok=%s, dt_us=%lu\n",
+//                   raw,
+//                   beam_ok ? "true" : "false",
+//                   (unsigned long)(nowUs - g_lastIrLowUs));
+// }
+
+
   yield();
+}
+
+
+void IRAM_ATTR ir_falling_isr() {
+  // TSOP output is active LOW when it detects IR carrier
+  // Just count pulses - much more robust than timing individual edges
+  g_pulseCount++;
+}
+
+void ir_init()
+{
+    ledcSetup(IR_PWM_CH, IR_FREQ, 8);   // 38 kHz, 8-bit
+    ledcAttachPin(IR_PWM_PIN, IR_PWM_CH);
+    ledcWrite(IR_PWM_CH, 0);            // start off
+}
+
+void ir_on()  { ledcWrite(IR_PWM_CH, IR_DUTY); }
+void ir_off() { ledcWrite(IR_PWM_CH, 0); }
+
+void ir_burst() {
+    // Call from loop() or a 1 kHz timer
+    static uint32_t t=0; static bool on=false;
+    if (micros() - t > 600) {  // ~600 µs
+      t = micros();
+      on = !on;
+      on ? ir_on() : ir_off();
+    }
+}
+
+// Map raw digital read to logical state
+inline IrState readIrRaw()
+{
+  // Check pulse count over a time window for robust detection
+  static IrState lastReading = IR_CLEAR;
+  uint32_t nowMs = millis();
+  
+  // Every 50ms, check if we got enough pulses
+  if (nowMs - g_lastPulseCheckMs >= 20) {
+    uint32_t pulses = g_pulseCount;
+    g_pulseCount = 0;  // Reset counter
+    g_lastPulseCheckMs = nowMs;
+    
+    // We burst at ~830 Hz (600µs on + 600µs off = 1200µs period)
+    // In 50ms we should see ~41 pulses if beam is clear
+    // Allow some margin: if we see >20 pulses, beam is clear
+    lastReading = (pulses > 8) ? IR_CLEAR : IR_BROKEN;
+  }
+  
+  // Return the last calculated reading
+  return lastReading;
 }
 
 void checkResetReason() {
@@ -360,7 +458,7 @@ void mqttInitialPublish() {
   client.publish(CAT_LOCATION_TOPIC, catLocation ? "ON" : "OFF", true);
 }
 
-void initCamera() {
+bool initCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
@@ -394,13 +492,20 @@ void initCamera() {
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x", err);
-    ESP.restart();
+    //ESP.restart();
+    return false;
   }
+  return true;
 }
 
 void captureAndSendImage() {
   roundTripTimer = millis();
+  ir_off();  // Turn off IR during image capture
+  delay(5); // Short delay to allow camera to adjust to lighting change. Increase if IR bleed shines through
   camera_fb_t * fb = esp_camera_fb_get();
+  ir_on(); // Turn IR back on after image capture
+  g_irSensingEnabled = true;   // unmask after carrier resumes
+
   esp_camera_fb_return(fb);
   fb = esp_camera_fb_get();
   if (!fb) {
@@ -944,13 +1049,13 @@ void handleInferenceTopic(String inferenceStr) {
     /* code */
   } else if (inferenceStr == "cat_morris_entering") {
     handleCatLocationCommand("ON");
-    handleFlapStateCommand("ON");
+    if(detectionModeEnabled) handleFlapStateCommand("ON");
   } else if (inferenceStr == "cat_morris_leaving") {
     handleCatLocationCommand("OFF");
   } else if (inferenceStr == "unknow_cat_entering") {
     /* code */
   } else if (inferenceStr == "prey") {
-    handleFlapStateCommand("OFF");
+    if(detectionModeEnabled) handleFlapStateCommand("OFF");
   }
 }
 
@@ -1143,25 +1248,18 @@ void handleIRBarrierStateChange(bool barrierBroken) {
   unsigned long currentTime = millis();
   if (barrierBroken) {
     if (currentTime - lastTriggerTime >= (cooldownDuration * 1000)) {
-      // Update the last IR state
-      lastIRState = LOW;  // Barrier is broken
 
       // Publish IR barrier state
       client.publish(IR_BARRIER_TOPIC, "broken", true);
 
-      // If detection mode is enabled
-      if (detectionModeEnabled) {
-        captureAndSendImage();
-      }
+      captureAndSendImage();
+
     } else {
       mqttDebugPrintln("Trigger ignored due to cooldown");
     }
   } else {
     // Update on falling edge
     lastTriggerTime = currentTime;
-
-    // Update the last IR state
-    lastIRState = HIGH;
 
     // Publish IR barrier state
     client.publish(IR_BARRIER_TOPIC, "clear", true);
@@ -1274,42 +1372,60 @@ void publishCooldownState() {
   client.publish(COOLDOWN_STATE_TOPIC, cooldownStr.c_str(), true);
 }
 
-void updateIRBarrierState() {
-  // Read the current state of the IR barrier
-  bool irBarrierState = (digitalRead(IR_PIN) == LOW); // true = barrier broken, false = barrier intact
-  unsigned long currentTime = millis();
+// Call this each loop()
+void updateIRBarrierState()
+{
+  if (!g_irSensingEnabled) return;  // masked (e.g., while taking a photo)
 
-  if (irBarrierState != barrierStableState) {
-    // Detected a potential state change
-    if (!debounceActive) {
-      // Start debouncing
-      debounceActive = true;
-      debounceStartTime = currentTime;
-      // Debugging Output
-      Serial.print("Potential state change detected. New state: ");
-      Serial.println(irBarrierState ? "Broken" : "Intact");
+  const uint32_t now = millis();
+  IrState reading = readIrRaw();
+
+  // DEBUG: Show pulse counts and current reading
+  static uint32_t lastDebugPulseCount = 0;
+  if (millis() - lastIrDebug > 500) {  // Check every 500ms
+    lastIrDebug = millis();
+    int raw = digitalRead(IR_PIN);
+    uint32_t currentPulses = g_pulseCount;
+    
+    mqttDebugPrintf("IR: raw=%d, pulses=%lu, reading=%s, stable=%s\n",
+                    raw,
+                    (unsigned long)currentPulses,
+                    reading == IR_CLEAR ? "CLEAR" : "BROKEN",
+                    g_stable == IR_CLEAR ? "CLEAR" : "BROKEN");
+    lastDebugPulseCount = currentPulses;
+  }
+
+
+  // new candidate?
+  if (reading != g_candidate) {
+    g_candidate = reading;
+    g_lastChangeMs = now;                  // start debounce window
+    mqttDebugPrintln("Potential state change detected. Debouncing...");
+    return;
+  }
+
+  // candidate held long enough?
+  if ((now - g_lastChangeMs) >= IR_DEBOUNCE_MS && g_candidate != g_stable) {
+    // rate limit final commit (prevents oscillation in marginal sunlight)
+    if ((now - g_lastStableMs) < IR_MIN_HOLD_MS) {
+      // still within hold window; skip committing
+      return;
+    }
+
+    g_stable = g_candidate;
+    g_lastStableMs = now;
+
+    handleIRBarrierStateChange(g_stable == IR_BROKEN);
+
+     // Announce new state
+
+    if (g_stable == IR_BROKEN) {
+      mqttDebugPrintln("Debounce OK → New state: Broken");
+      client.publish(IR_BARRIER_TOPIC, "broken", true);
     } else {
-      // Check if debounce duration has passed
-      if ((currentTime - debounceStartTime) >= DEBOUNCE_DURATION_MS) {
-        // Debounce time met, confirm the state change
-        barrierStableState = irBarrierState;
-        barrierTriggered = barrierStableState;
-        handleIRBarrierStateChange(barrierTriggered);
-        debounceActive = false;
-        // Debugging Output
-        Serial.print("State change confirmed. New state: ");
-        Serial.println(barrierTriggered ? "Broken" : "Intact");
-      }
-      // If debounce duration not met, continue waiting
+      mqttDebugPrintln("Debounce OK → New state: Clear");
+      client.publish(IR_BARRIER_TOPIC, "clear", true);
     }
-  } else {
-    // No state change detected, reset debounce
-    if (debounceActive) {
-      debounceActive = false;
-      // Debugging Output
-      Serial.println("State reverted during debounce. Debounce reset.");
-    }
-    // No action needed if already stable
   }
 }
 
