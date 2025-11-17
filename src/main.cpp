@@ -61,6 +61,8 @@ const char* password = WIFI_PASSWORD;
 #define IR_DUTY    64
 #define IR_DEBOUNCE_MS       10        // time input must stay stable
 #define IR_MIN_HOLD_MS       120       // rate-limit chatter (optional)
+#define PULSE_CHECK_INTERVAL 50        
+#define PULSE_THRESHOLD      20        
 //#define IR_SEEN_WINDOW_US    1500   // Beam is 'OK' if a LOW edge was seen in last 3 ms
 
 // Camera pin configuration
@@ -301,7 +303,7 @@ inline IrState readIrRaw()
   uint32_t nowMs = millis();
   
   // Every 50ms, check if we got enough pulses
-  if (nowMs - g_lastPulseCheckMs >= 20) {
+  if (nowMs - g_lastPulseCheckMs >= PULSE_CHECK_INTERVAL) {
     uint32_t pulses = g_pulseCount;
     g_pulseCount = 0;  // Reset counter
     g_lastPulseCheckMs = nowMs;
@@ -309,7 +311,7 @@ inline IrState readIrRaw()
     // We burst at ~830 Hz (600µs on + 600µs off = 1200µs period)
     // In 50ms we should see ~41 pulses if beam is clear
     // Allow some margin: if we see >20 pulses, beam is clear
-    lastReading = (pulses > 8) ? IR_CLEAR : IR_BROKEN;
+    lastReading = (pulses > PULSE_THRESHOLD) ? IR_CLEAR : IR_BROKEN;
   }
   
   // Return the last calculated reading
@@ -1387,11 +1389,16 @@ void updateIRBarrierState()
     int raw = digitalRead(IR_PIN);
     uint32_t currentPulses = g_pulseCount;
     
-    mqttDebugPrintf("IR: raw=%d, pulses=%lu, reading=%s, stable=%s\n",
-                    raw,
-                    (unsigned long)currentPulses,
-                    reading == IR_CLEAR ? "CLEAR" : "BROKEN",
-                    g_stable == IR_CLEAR ? "CLEAR" : "BROKEN");
+    // Format the debug message
+    char buffer[128];
+    snprintf(buffer, sizeof(buffer), 
+             "raw=%d, pulses=%lu, reading=%s, stable=%s",
+             raw,
+             (unsigned long)currentPulses,
+             reading == IR_CLEAR ? "CLEAR" : "BROKEN",
+             g_stable == IR_CLEAR ? "CLEAR" : "BROKEN");
+    
+    client.publish("catflap/ir_debug", buffer, false);
     lastDebugPulseCount = currentPulses;
   }
 
