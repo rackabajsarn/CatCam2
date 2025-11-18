@@ -500,7 +500,7 @@ esp_err_t initCamera() {
 
   // Frame parameters
   config.frame_size   = FRAMESIZE_VGA;
-  config.jpeg_quality = 30; // Lower means higher quality
+  config.jpeg_quality = 10; // Lower means higher quality
   config.fb_count     = 1;
   config.grab_mode    = CAMERA_GRAB_LATEST;
 
