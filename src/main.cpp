@@ -45,11 +45,12 @@ const char* password = WIFI_PASSWORD;
 
 // EEPROM Addresses
 #define EEPROM_SIZE 64
-#define EEPROM_VERSION 2  // Increment this number whenever you change the EEPROM layout
+#define EEPROM_VERSION 3  // Increment this number whenever you change the EEPROM layout
 #define EEPROM_ADDRESS_VERSION 0
 #define EEPROM_ADDRESS_DETECTION_MODE 1
-#define EEPROM_ADDR_COOLDOWN 2  // Assuming previous addresses are 0 and 1
-#define EEPROM_ADDRESS_CAMERA_SETTINGS 3  // Starting address for camera settings
+#define EEPROM_ADDR_COOLDOWN 2
+#define EEPROM_ADDRESS_CAT_LOCATION 3
+#define EEPROM_ADDRESS_CAMERA_SETTINGS 4  // Starting address for camera settings
 
 // GPIO Definitions
 #define IR_PIN 32
@@ -58,11 +59,11 @@ const char* password = WIFI_PASSWORD;
 #define IR_PWM_PIN 14
 #define IR_PWM_CH  2
 #define IR_FREQ    38000
-#define IR_DUTY    64
+#define IR_DUTY    128
 #define IR_DEBOUNCE_MS       10        // time input must stay stable
 #define IR_MIN_HOLD_MS       120       // rate-limit chatter (optional)
-#define PULSE_CHECK_INTERVAL 50        
-#define PULSE_THRESHOLD      20        
+#define PULSE_CHECK_INTERVAL 20        // 50 ms between pulse count checks
+#define PULSE_THRESHOLD      8        // 20 pulses in interval means beam is OK
 //#define IR_SEEN_WINDOW_US    1500   // Beam is 'OK' if a LOW edge was seen in last 3 ms
 
 // Camera pin configuration
@@ -87,6 +88,8 @@ const char* password = WIFI_PASSWORD;
 // Forward declarations of functions
 void IRAM_ATTR ir_falling_isr();
 void checkResetReason();
+enum IrState : uint8_t { IR_CLEAR=0, IR_BROKEN=1 };  // CLEAR = beam received
+inline IrState readIrRaw();
 void ir_init();
 void ir_on();
 void ir_off();
@@ -164,7 +167,6 @@ float cooldownDuration = 0.0;    // Cooldown duration in seconds (default to 0)
 unsigned long lastTriggerTime = 0;     // Timestamp of the last valid trigger
 unsigned long lastIrDebug = 0;
 
-enum IrState : uint8_t { IR_CLEAR=0, IR_BROKEN=1 };  // CLEAR = beam received
 static IrState g_stable = IR_CLEAR;
 static IrState g_candidate = IR_CLEAR;
 static uint32_t g_lastChangeMs = 0;      // when candidate changed
@@ -188,14 +190,27 @@ void setup() {
   }
 
   // Initialize GPIOs
-  pinMode(IR_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(IR_PIN), ir_falling_isr, FALLING);
+  pinMode(IR_PIN, INPUT);
+  pinMode(ENABLE_FLAP_PIN, OUTPUT);
+  
+  // Start IR transmitter FIRST
+  ir_init();
+  ir_on();
+  
+  // Give the IR carrier time to stabilize and TSOP to settle
+  delay(100);
+  
+  // NOW attach the interrupt and reset counters
   g_pulseCount = 0;
   g_lastPulseCheckMs = millis();
-  //pinMode(OPEN_SENSOR_PIN, INPUT);
-  pinMode(ENABLE_FLAP_PIN, OUTPUT);
-  ir_init();
-  ir_on(); // Start IR immediately so we can get readings
+  attachInterrupt(digitalPinToInterrupt(IR_PIN), ir_falling_isr, FALLING);
+  
+  // Wait for first valid reading
+  delay(PULSE_CHECK_INTERVAL + 5);  // Wait one pulse check interval
+  IrState initialReading = readIrRaw();
+  g_stable = initialReading;
+  g_candidate = initialReading;
+  g_lastStableMs = millis();  // ← ADD THIS LINE
 
   setup_wifi();
     // Disable Wi-Fi power save mode
@@ -357,17 +372,18 @@ void initializeEEPROM() {
   // Initialize settings to default values
   detectionModeEnabled = true;
   cooldownDuration = 0.0;
+  catLocation = true; // default: cat is home
   
   // Initialize camera settings to defaults
   sensor_t * s = esp_camera_sensor_get();
   if (s != NULL) {
     s->set_framesize(s, FRAMESIZE_VGA);
-    s->set_quality(s, 30);
-    s->set_brightness(s, 0);
-    s->set_contrast(s, 0);
+    s->set_quality(s, 10);
+    s->set_brightness(s, -2);
+    s->set_contrast(s, 1);
     s->set_saturation(s, 0);
     s->set_whitebal(s, true);
-    s->set_special_effect(s, 0);
+    s->set_special_effect(s, 2);
   }
 
   // Save default settings to EEPROM
@@ -1088,6 +1104,7 @@ void handleCatLocationCommand(String locationStr) {
   catLocation = locationStr.equalsIgnoreCase("ON");
   client.publish(CAT_LOCATION_TOPIC, catLocation ? "ON" : "OFF", true);
   mqttDebugPrintln("Cat location updated");
+   lastSettingsChangeTime = millis();
 }
 
 void handleFrameSizeCommand(String frameSizeStr) {
@@ -1383,31 +1400,33 @@ void updateIRBarrierState()
   IrState reading = readIrRaw();
 
   // DEBUG: Show pulse counts and current reading
-  static uint32_t lastDebugPulseCount = 0;
-  if (millis() - lastIrDebug > 500) {  // Check every 500ms
-    lastIrDebug = millis();
-    int raw = digitalRead(IR_PIN);
-    uint32_t currentPulses = g_pulseCount;
-    
-    // Format the debug message
-    char buffer[128];
-    snprintf(buffer, sizeof(buffer), 
-             "raw=%d, pulses=%lu, reading=%s, stable=%s",
-             raw,
-             (unsigned long)currentPulses,
-             reading == IR_CLEAR ? "CLEAR" : "BROKEN",
-             g_stable == IR_CLEAR ? "CLEAR" : "BROKEN");
-    
-    client.publish("catflap/ir_debug", buffer, false);
-    lastDebugPulseCount = currentPulses;
+  if (false)
+  {
+    static uint32_t lastDebugPulseCount = 0;
+    if (millis() - lastIrDebug > 500) {  // Check every 500ms
+      lastIrDebug = millis();
+      int raw = digitalRead(IR_PIN);
+      uint32_t currentPulses = g_pulseCount;
+      
+      // Format the debug message
+      char buffer[128];
+      snprintf(buffer, sizeof(buffer), 
+              "raw=%d, pulses=%lu, reading=%s, stable=%s",
+              raw,
+              (unsigned long)currentPulses,
+              reading == IR_CLEAR ? "CLEAR" : "BROKEN",
+              g_stable == IR_CLEAR ? "CLEAR" : "BROKEN");
+      
+      client.publish("catflap/ir_debug", buffer, false);
+      lastDebugPulseCount = currentPulses;
+    }
   }
-
-
+ 
   // new candidate?
   if (reading != g_candidate) {
     g_candidate = reading;
     g_lastChangeMs = now;                  // start debounce window
-    mqttDebugPrintln("Potential state change detected. Debouncing...");
+    //mqttDebugPrintln("Potential state change detected. Debouncing...");
     return;
   }
 
@@ -1423,16 +1442,6 @@ void updateIRBarrierState()
     g_lastStableMs = now;
 
     handleIRBarrierStateChange(g_stable == IR_BROKEN);
-
-     // Announce new state
-
-    if (g_stable == IR_BROKEN) {
-      mqttDebugPrintln("Debounce OK → New state: Broken");
-      client.publish(IR_BARRIER_TOPIC, "broken", true);
-    } else {
-      mqttDebugPrintln("Debounce OK → New state: Clear");
-      client.publish(IR_BARRIER_TOPIC, "clear", true);
-    }
   }
 }
 
@@ -1489,6 +1498,9 @@ void saveSettingsToEEPROM() {
   // Save Cooldown Duration
   EEPROM.write(EEPROM_ADDR_COOLDOWN, (int)(cooldownDuration * 10));
 
+  // Save cat location (1 = home/ON, 0 = away/OFF)
+  EEPROM.write(EEPROM_ADDRESS_CAT_LOCATION, catLocation ? 1 : 0);
+
   // Save camera settings
   sensor_t * s = esp_camera_sensor_get();
   if (s != NULL) {
@@ -1532,6 +1544,15 @@ void loadSettingsFromEEPROM() {
   } else {
     mqttDebugPrintln("Invalid cooldown value in EEPROM. Setting to default (0.0).");
     cooldownDuration = 0.0;  // Default value
+  }
+
+  // Read and validate Cat Location
+  uint8_t catLocationValue = EEPROM.read(EEPROM_ADDRESS_CAT_LOCATION);
+  if (catLocationValue == 0 || catLocationValue == 1) {
+    catLocation = (catLocationValue == 1);
+  } else {
+    mqttDebugPrintln("Invalid cat location in EEPROM. Setting to default (home).");
+    catLocation = true;  // Default: home
   }
 
   // Load and validate Camera Settings
