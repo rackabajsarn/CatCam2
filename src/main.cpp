@@ -99,7 +99,7 @@ void mqttConnect();
 void mqttReconnect();
 void mqttSubscribe();
 void mqttInitialPublish();
-bool initCamera();
+esp_err_t initCamera();
 void captureAndSendImage();
 void enableFlap();
 void disableFlap();
@@ -179,7 +179,7 @@ static uint32_t g_lastPulseCheckMs = 0;       // last time we checked pulse coun
 void setup() {
   Serial.begin(115200);
 
-  bool cameraInitialized = initCamera();
+  esp_err_t cameraInitStatus = initCamera();
   
   // Initialize EEPROM
   EEPROM.begin(EEPROM_SIZE);
@@ -228,11 +228,9 @@ void setup() {
   checkResetReason();
   publishIPState();
   mqttDebugPrintln("ESP Setup finished");
-  if (!cameraInitialized)
-  {
-    mqttDebugPrintln("Camera setup failed");
-  }
-  
+  mqttDebugPrintf("Camera init: 0x%x (%s)\n",
+                cameraInitStatus,
+                esp_err_to_name(cameraInitStatus));
 }
 
 void loop() {
@@ -476,7 +474,7 @@ void mqttInitialPublish() {
   client.publish(CAT_LOCATION_TOPIC, catLocation ? "ON" : "OFF", true);
 }
 
-bool initCamera() {
+esp_err_t initCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
@@ -511,9 +509,8 @@ bool initCamera() {
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x", err);
     //ESP.restart();
-    return false;
   }
-  return true;
+  return err;
 }
 
 void captureAndSendImage() {
