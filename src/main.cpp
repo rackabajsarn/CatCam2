@@ -182,14 +182,8 @@ void setup() {
 
   cameraInitStatus = initCamera();
   
-  // Initialize EEPROM
   EEPROM.begin(EEPROM_SIZE);
-  if (!isEEPROMInitialized()) {
-    initializeEEPROM();
-  } else {
-    loadSettingsFromEEPROM();
-  }
-
+  
   // Initialize GPIOs
   pinMode(IR_PIN, INPUT);
   pinMode(ENABLE_FLAP_PIN, OUTPUT);
@@ -226,8 +220,17 @@ void setup() {
   mqttConnect();
 
   setupOTA();  // Initialize OTA
+
+  // Initialize EEPROM
+  if (!isEEPROMInitialized()) {
+    initializeEEPROM();
+  } else {
+    loadSettingsFromEEPROM();
+  }
+
   checkResetReason();
   publishIPState();
+  mqttInitialPublish();
   mqttDebugPrintln("ESP Setup finished");
   mqttDebugPrintf("Camera init: 0x%x (%s)\n",
                 cameraInitStatus,
@@ -419,7 +422,6 @@ void mqttConnect() {
     if (client.connect(clientId.c_str())) {
       Serial.println("connected");
       mqttSubscribe();
-      mqttInitialPublish();
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -520,7 +522,7 @@ void captureAndSendImage() {
     return;
   }
   roundTripTimer = millis();
-  g_irSensingEnabled = false;  // mask while IR is off
+  //g_irSensingEnabled = false;  // mask while IR is off
   ir_off();  // Turn off IR during image capture
   delay(5); // Short delay to allow camera to adjust to lighting change. Increase if IR bleed shines through
   camera_fb_t * fb = esp_camera_fb_get();
