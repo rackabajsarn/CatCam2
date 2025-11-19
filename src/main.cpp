@@ -30,9 +30,12 @@ const char* password = WIFI_PASSWORD;
 #define CAT_LOCATION_TOPIC "catflap/cat_location"
 #define DEBUG_TOGGLE_TOPIC "catflap/debug_toggle"
 #define COOLDOWN_STATE_TOPIC "catflap/cooldown"
+#define CAMERA_PRESET_TOPIC "catflap/camera_preset"
 #define SET_DETECTION_MODE_TOPIC "catflap/detection_mode/set"
 #define SET_DEBUG_TOGGLE_TOPIC "catflap/debug_toggle/set"
 #define SET_COOLDOWN_TOPIC "catflap/cooldown/set"
+#define SET_CAMERA_PRESET_TOPIC "catflap/camera_preset/set"
+#define SET_CAMERA_PRESET_SAVE_TOPIC "catflap/camera_preset/save"
 #define SET_AE_LEVEL_TOPIC "catflap/ae_level/set"
 #define SET_AEC_VALUE_TOPIC "catflap/aec_value/set"
 #define SET_EXPOSURE_CTRL_TOPIC "catflap/exposure_ctrl/set"
@@ -50,13 +53,16 @@ const char* password = WIFI_PASSWORD;
 #define DEVICE_SW_VERSION "1.0.1" //Increment together with git commits
 
 // EEPROM Addresses
-#define EEPROM_SIZE 96
-#define EEPROM_VERSION 4  // Increment this number whenever you change the EEPROM layout
+#define EEPROM_SIZE 160
+#define EEPROM_VERSION 5  // Increment this number whenever you change the EEPROM layout
 #define EEPROM_ADDRESS_VERSION 0
 #define EEPROM_ADDRESS_DETECTION_MODE 1
 #define EEPROM_ADDR_COOLDOWN 2
 #define EEPROM_ADDRESS_CAT_LOCATION 3
-#define EEPROM_ADDRESS_CAMERA_SETTINGS 4  // Starting address for camera settings
+#define EEPROM_ADDRESS_CAMERA_SETTINGS 4   // Live camera settings (14 bytes currently)
+#define EEPROM_ADDRESS_PRESET_DAY   20     // Day preset camera settings
+#define EEPROM_ADDRESS_PRESET_NIGHT 36     // Night preset camera settings
+#define EEPROM_ADDRESS_ACTIVE_PRESET 52    // 0=day, 1=night
 
 // GPIO Definitions
 #define IR_PIN 32
@@ -137,6 +143,8 @@ void handleExposureCtrlCommand(String stateStr);
 void handleAec2Command(String stateStr);
 void handleGainCtrlCommand(String stateStr);
 void handleAgcGainCommand(String valueStr);
+void handleCameraPresetSelect(String presetStr);
+void handleCameraPresetSave();
 void handleIRBarrierStateChange(bool barrierBroken);
 void saveSettingsToEEPROM();
 void loadSettingsFromEEPROM();
@@ -147,6 +155,8 @@ void handleFlapStateCommand(String stateStr);
 void updateIRBarrierState();
 bool isEEPROMInitialized();
 void initializeEEPROM();
+void savePresetToEEPROM(uint8_t presetIndex);
+void applyPresetFromEEPROM(uint8_t presetIndex);
 // Add more handler functions as needed
 
 WiFiClient espClient;
@@ -179,6 +189,8 @@ unsigned long roundTripTimer = 0;
 float cooldownDuration = 0.0;    // Cooldown duration in seconds (default to 0)
 unsigned long lastTriggerTime = 0;     // Timestamp of the last valid trigger
 unsigned long lastIrDebug = 0;
+
+uint8_t activeCameraPreset = 0; // 0 = day, 1 = night
 
 static IrState g_stable = IR_CLEAR;
 static IrState g_candidate = IR_CLEAR;
@@ -408,6 +420,15 @@ void initializeEEPROM() {
 
   // Save default settings to EEPROM
   saveSettingsToEEPROM();
+
+  // Initialize presets: copy current camera settings into both day and night
+  savePresetToEEPROM(0); // day
+  savePresetToEEPROM(1); // night
+
+  // Default active preset: day
+  activeCameraPreset = 0;
+  EEPROM.write(EEPROM_ADDRESS_ACTIVE_PRESET, activeCameraPreset);
+  EEPROM.commit();
 }
 
 void setup_wifi() {
@@ -490,6 +511,8 @@ void mqttSubscribe() {
   client.subscribe(SET_AEC2_TOPIC);
   client.subscribe(SET_GAIN_CTRL_TOPIC);
   client.subscribe(SET_AGC_GAIN_TOPIC);
+  client.subscribe(SET_CAMERA_PRESET_TOPIC);
+  client.subscribe(SET_CAMERA_PRESET_SAVE_TOPIC);
 }
 
 void mqttInitialPublish() {
@@ -499,6 +522,7 @@ void mqttInitialPublish() {
   client.publish(DETECTION_MODE_TOPIC, detectionModeEnabled ? "ON" : "OFF", true);
   client.publish(DEBUG_TOGGLE_TOPIC, mqttDebugEnabled ? "ON" : "OFF", true);
   client.publish(CAT_LOCATION_TOPIC, catLocation ? "ON" : "OFF", true);
+  client.publish(CAMERA_PRESET_TOPIC, activeCameraPreset == 0 ? "day" : "night", true);
 }
 
 esp_err_t initCamera() {
@@ -642,6 +666,10 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
     handleGainCtrlCommand(incomingMessage);
   } else if (String(topic) == SET_AGC_GAIN_TOPIC) {
     handleAgcGainCommand(incomingMessage);
+  } else if (String(topic) == SET_CAMERA_PRESET_TOPIC) {
+    handleCameraPresetSelect(incomingMessage);
+  } else if (String(topic) == SET_CAMERA_PRESET_SAVE_TOPIC) {
+    handleCameraPresetSave();
   } else if (String(topic) == INFERENCE_TOPIC) {
     handleInferenceTopic(incomingMessage);
   } else if (String(topic) == SET_CAT_LOCATION_TOPIC) {
@@ -941,6 +969,37 @@ void publishDiscoveryConfigs() {
   String agcGainConfigPayload;
   serializeJson(agcGainConfig, agcGainConfigPayload);
   client.publish(agcGainConfigTopic.c_str(), agcGainConfigPayload.c_str(), true);
+
+  // Camera Preset Select (day/night)
+  String cameraPresetConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/select/" + DEVICE_NAME + "/camera_preset/config";
+  DynamicJsonDocument cameraPresetConfig(capacity);
+  cameraPresetConfig["name"] = "Camera Preset";
+  cameraPresetConfig["command_topic"] = SET_CAMERA_PRESET_TOPIC;
+  cameraPresetConfig["state_topic"] = CAMERA_PRESET_TOPIC;
+  cameraPresetConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_camera_preset";
+  cameraPresetConfig["icon"] = "mdi:theme-light-dark";
+  JsonArray presetOptions = cameraPresetConfig.createNestedArray("options");
+  presetOptions.add("day");
+  presetOptions.add("night");
+  JsonObject deviceInfoPreset = cameraPresetConfig.createNestedObject("device");
+  deviceInfoPreset["identifiers"] = DEVICE_UNIQUE_ID;
+  String cameraPresetConfigPayload;
+  serializeJson(cameraPresetConfig, cameraPresetConfigPayload);
+  client.publish(cameraPresetConfigTopic.c_str(), cameraPresetConfigPayload.c_str(), true);
+
+  // Camera Preset Save Button (save current settings to selected preset)
+  String cameraPresetSaveConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/button/" + DEVICE_NAME + "/camera_preset_save/config";
+  DynamicJsonDocument cameraPresetSaveConfig(capacity);
+  cameraPresetSaveConfig["name"] = "Save Camera Preset";
+  cameraPresetSaveConfig["command_topic"] = SET_CAMERA_PRESET_SAVE_TOPIC;
+  cameraPresetSaveConfig["payload_press"] = "save";
+  cameraPresetSaveConfig["icon"] = "mdi:content-save";
+  cameraPresetSaveConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_camera_preset_save";
+  JsonObject deviceInfoPresetSave = cameraPresetSaveConfig.createNestedObject("device");
+  deviceInfoPresetSave["identifiers"] = DEVICE_UNIQUE_ID;
+  String cameraPresetSaveConfigPayload;
+  serializeJson(cameraPresetSaveConfig, cameraPresetSaveConfigPayload);
+  client.publish(cameraPresetSaveConfigTopic.c_str(), cameraPresetSaveConfigPayload.c_str(), true);
 
   // Brightness Number
   String brightnessConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/brightness/config";
@@ -1797,6 +1856,14 @@ void loadSettingsFromEEPROM() {
     catLocation = true;  // Default: home
   }
 
+  // Active camera preset (0=day, 1=night)
+  uint8_t presetValue = EEPROM.read(EEPROM_ADDRESS_ACTIVE_PRESET);
+  if (presetValue <= 1) {
+    activeCameraPreset = presetValue;
+  } else {
+    activeCameraPreset = 0;
+  }
+
   // Load and validate Camera Settings
   sensor_t * s = esp_camera_sensor_get();
   if (s != NULL) {
@@ -1923,4 +1990,162 @@ void loadSettingsFromEEPROM() {
   } else {
     mqttDebugPrintln("Failed to get camera sensor. Cannot load camera settings from EEPROM.");
   }
+}
+
+// Helper: save current sensor settings into a preset slot
+void savePresetToEEPROM(uint8_t presetIndex) {
+  if (presetIndex > 1) return;
+
+  uint16_t base = (presetIndex == 0) ? EEPROM_ADDRESS_PRESET_DAY : EEPROM_ADDRESS_PRESET_NIGHT;
+
+  sensor_t * s = esp_camera_sensor_get();
+  if (s == NULL) {
+    mqttDebugPrintln("savePresetToEEPROM: sensor NULL");
+    return;
+  }
+
+  EEPROM.write(base + 0, s->status.framesize);
+  EEPROM.write(base + 1, s->status.quality);
+  EEPROM.write(base + 2, s->status.brightness);
+  EEPROM.write(base + 3, s->status.contrast);
+  EEPROM.write(base + 4, s->status.saturation);
+  EEPROM.write(base + 5, s->status.awb ? 1 : 0);
+  EEPROM.write(base + 6, s->status.special_effect);
+  EEPROM.write(base + 7, (int8_t)s->status.ae_level);
+  EEPROM.write(base + 8, (uint8_t)(s->status.aec_value & 0xFF));
+  EEPROM.write(base + 9, (uint8_t)((s->status.aec_value >> 8) & 0xFF));
+  EEPROM.write(base + 10, s->status.aec ? 1 : 0);
+  EEPROM.write(base + 11, s->status.aec2 ? 1 : 0);
+  EEPROM.write(base + 12, s->status.agc ? 1 : 0);
+  EEPROM.write(base + 13, s->status.agc_gain);
+
+  EEPROM.commit();
+}
+
+// Helper: apply a preset from EEPROM to the sensor
+void applyPresetFromEEPROM(uint8_t presetIndex) {
+  if (presetIndex > 1) return;
+
+  uint16_t base = (presetIndex == 0) ? EEPROM_ADDRESS_PRESET_DAY : EEPROM_ADDRESS_PRESET_NIGHT;
+
+  sensor_t * s = esp_camera_sensor_get();
+  if (s == NULL) {
+    mqttDebugPrintln("applyPresetFromEEPROM: sensor NULL");
+    return;
+  }
+
+  // Framesize
+  uint8_t framesizeValue = EEPROM.read(base + 0);
+  if (framesizeValue >= FRAMESIZE_QQVGA && framesizeValue <= FRAMESIZE_UXGA) {
+    s->set_framesize(s, (framesize_t)framesizeValue);
+  }
+
+  // JPEG Quality
+  uint8_t qualityValue = EEPROM.read(base + 1);
+  if (qualityValue >= 10 && qualityValue <= 63) {
+    s->set_quality(s, qualityValue);
+  }
+
+  // Brightness
+  int8_t brightnessValue = (int8_t)EEPROM.read(base + 2);
+  if (brightnessValue >= -2 && brightnessValue <= 2) {
+    s->set_brightness(s, brightnessValue);
+  }
+
+  // Contrast
+  int8_t contrastValue = (int8_t)EEPROM.read(base + 3);
+  if (contrastValue >= -2 && contrastValue <= 2) {
+    s->set_contrast(s, contrastValue);
+  }
+
+  // Saturation
+  int8_t saturationValue = (int8_t)EEPROM.read(base + 4);
+  if (saturationValue >= -2 && saturationValue <= 2) {
+    s->set_saturation(s, saturationValue);
+  }
+
+  // AWB
+  uint8_t awbValue = EEPROM.read(base + 5);
+  if (awbValue == 0 || awbValue == 1) {
+    s->set_whitebal(s, awbValue == 1);
+  }
+
+  // Special Effect
+  uint8_t effectValue = EEPROM.read(base + 6);
+  if (effectValue <= 6) {
+    s->set_special_effect(s, effectValue);
+  }
+
+  // AE Level
+  int8_t aeLevelValue = (int8_t)EEPROM.read(base + 7);
+  if (aeLevelValue >= -2 && aeLevelValue <= 2) {
+    s->set_ae_level(s, aeLevelValue);
+  }
+
+  // AEC Value
+  uint8_t aecLo = EEPROM.read(base + 8);
+  uint8_t aecHi = EEPROM.read(base + 9);
+  uint16_t aecValue = (uint16_t)aecLo | ((uint16_t)aecHi << 8);
+  if (aecValue <= 1200) {
+    s->set_aec_value(s, aecValue);
+  }
+
+  // Exposure Control
+  uint8_t exposureCtrlValue = EEPROM.read(base + 10);
+  if (exposureCtrlValue == 0 || exposureCtrlValue == 1) {
+    s->set_exposure_ctrl(s, exposureCtrlValue == 1);
+  }
+
+  // AEC2
+  uint8_t aec2Value = EEPROM.read(base + 11);
+  if (aec2Value == 0 || aec2Value == 1) {
+    s->set_aec2(s, aec2Value == 1);
+  }
+
+  // Gain Control
+  uint8_t gainCtrlValue = EEPROM.read(base + 12);
+  if (gainCtrlValue == 0 || gainCtrlValue == 1) {
+    s->set_gain_ctrl(s, gainCtrlValue == 1);
+  }
+
+  // AGC Gain
+  uint8_t agcGainValue = EEPROM.read(base + 13);
+  if (agcGainValue <= 30) {
+    s->set_agc_gain(s, agcGainValue);
+  }
+
+  // After applying, publish current settings so HA stays in sync
+  publishCameraSettings();
+}
+
+void handleCameraPresetSelect(String presetStr) {
+  uint8_t newPreset;
+  if (presetStr.equalsIgnoreCase("day")) {
+    newPreset = 0;
+  } else if (presetStr.equalsIgnoreCase("night")) {
+    newPreset = 1;
+  } else {
+    mqttDebugPrintln("Invalid camera preset");
+    return;
+  }
+
+  activeCameraPreset = newPreset;
+  EEPROM.write(EEPROM_ADDRESS_ACTIVE_PRESET, activeCameraPreset);
+  EEPROM.commit();
+
+  applyPresetFromEEPROM(activeCameraPreset);
+
+  // Publish preset state
+  client.publish(CAMERA_PRESET_TOPIC, activeCameraPreset == 0 ? "day" : "night", true);
+  mqttDebugPrintln("Camera preset applied");
+
+  lastSettingsChangeTime = millis();
+}
+
+void handleCameraPresetSave() {
+  // Save current sensor settings into the currently active preset
+  savePresetToEEPROM(activeCameraPreset);
+  mqttDebugPrintln("Camera preset saved to EEPROM");
+
+  lastSettingsChangeTime = millis();
 }
