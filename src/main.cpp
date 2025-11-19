@@ -33,6 +33,12 @@ const char* password = WIFI_PASSWORD;
 #define SET_DETECTION_MODE_TOPIC "catflap/detection_mode/set"
 #define SET_DEBUG_TOGGLE_TOPIC "catflap/debug_toggle/set"
 #define SET_COOLDOWN_TOPIC "catflap/cooldown/set"
+#define SET_AE_LEVEL_TOPIC "catflap/ae_level/set"
+#define SET_AEC_VALUE_TOPIC "catflap/aec_value/set"
+#define SET_EXPOSURE_CTRL_TOPIC "catflap/exposure_ctrl/set"
+#define SET_AEC2_TOPIC "catflap/aec2/set"
+#define SET_GAIN_CTRL_TOPIC "catflap/gain_ctrl/set"
+#define SET_AGC_GAIN_TOPIC "catflap/agc_gain/set"
 #define SET_CAT_LOCATION_TOPIC "catflap/cat_location/set"
 #define SET_FLAP_STATE_TOPIC "catflap/flap_state/set"
 #define INFERENCE_TOPIC "catflap/inference"
@@ -44,8 +50,8 @@ const char* password = WIFI_PASSWORD;
 #define DEVICE_SW_VERSION "1.0.1" //Increment together with git commits
 
 // EEPROM Addresses
-#define EEPROM_SIZE 64
-#define EEPROM_VERSION 3  // Increment this number whenever you change the EEPROM layout
+#define EEPROM_SIZE 96
+#define EEPROM_VERSION 4  // Increment this number whenever you change the EEPROM layout
 #define EEPROM_ADDRESS_VERSION 0
 #define EEPROM_ADDRESS_DETECTION_MODE 1
 #define EEPROM_ADDR_COOLDOWN 2
@@ -125,6 +131,12 @@ void handleSaturationCommand(String saturationStr);
 void handleAWBCommand(String awbStateStr);
 void handleSpecialEffectCommand(String effectStr);
 void handleCooldownCommand(String cooldownStr);
+void handleAeLevelCommand(String levelStr);
+void handleAecValueCommand(String valueStr);
+void handleExposureCtrlCommand(String stateStr);
+void handleAec2Command(String stateStr);
+void handleGainCtrlCommand(String stateStr);
+void handleAgcGainCommand(String valueStr);
 void handleIRBarrierStateChange(bool barrierBroken);
 void saveSettingsToEEPROM();
 void loadSettingsFromEEPROM();
@@ -386,6 +398,12 @@ void initializeEEPROM() {
     s->set_saturation(s, 0);
     s->set_whitebal(s, true);
     s->set_special_effect(s, 2);
+    s->set_ae_level(s, 0);
+    s->set_aec_value(s, 0);
+    s->set_exposure_ctrl(s, 1); // auto exposure on
+    s->set_aec2(s, 0);          // extra AEC off
+    s->set_gain_ctrl(s, 1);     // auto gain on
+    s->set_agc_gain(s, 0);
   }
 
   // Save default settings to EEPROM
@@ -466,6 +484,12 @@ void mqttSubscribe() {
   client.subscribe(SET_FLAP_STATE_TOPIC);
   client.subscribe(SET_CAT_LOCATION_TOPIC);  
   client.subscribe(INFERENCE_TOPIC);
+  client.subscribe(SET_AE_LEVEL_TOPIC);
+  client.subscribe(SET_AEC_VALUE_TOPIC);
+  client.subscribe(SET_EXPOSURE_CTRL_TOPIC);
+  client.subscribe(SET_AEC2_TOPIC);
+  client.subscribe(SET_GAIN_CTRL_TOPIC);
+  client.subscribe(SET_AGC_GAIN_TOPIC);
 }
 
 void mqttInitialPublish() {
@@ -606,6 +630,18 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
     handleDebugToggleCommand(incomingMessage);
   } else if (String(topic) == SET_COOLDOWN_TOPIC) {
     handleCooldownCommand(incomingMessage);
+  } else if (String(topic) == SET_AE_LEVEL_TOPIC) {
+    handleAeLevelCommand(incomingMessage);
+  } else if (String(topic) == SET_AEC_VALUE_TOPIC) {
+    handleAecValueCommand(incomingMessage);
+  } else if (String(topic) == SET_EXPOSURE_CTRL_TOPIC) {
+    handleExposureCtrlCommand(incomingMessage);
+  } else if (String(topic) == SET_AEC2_TOPIC) {
+    handleAec2Command(incomingMessage);
+  } else if (String(topic) == SET_GAIN_CTRL_TOPIC) {
+    handleGainCtrlCommand(incomingMessage);
+  } else if (String(topic) == SET_AGC_GAIN_TOPIC) {
+    handleAgcGainCommand(incomingMessage);
   } else if (String(topic) == INFERENCE_TOPIC) {
     handleInferenceTopic(incomingMessage);
   } else if (String(topic) == SET_CAT_LOCATION_TOPIC) {
@@ -813,6 +849,99 @@ void publishDiscoveryConfigs() {
   serializeJson(jpegQualityConfig, jpegQualityConfigPayload);
   client.publish(jpegQualityConfigTopic.c_str(), jpegQualityConfigPayload.c_str(), true);
 
+  // AE Level Number (-2..2)
+  String aeLevelConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/ae_level/config";
+  DynamicJsonDocument aeLevelConfig(capacity);
+  aeLevelConfig["name"] = "Camera AE Level";
+  aeLevelConfig["command_topic"] = "catflap/ae_level/set";
+  aeLevelConfig["state_topic"] = "catflap/ae_level";
+  aeLevelConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_ae_level";
+  aeLevelConfig["min"] = -2;
+  aeLevelConfig["max"] = 2;
+  aeLevelConfig["step"] = 1;
+  JsonObject deviceInfoAeLevel = aeLevelConfig.createNestedObject("device");
+  deviceInfoAeLevel["identifiers"] = DEVICE_UNIQUE_ID;
+  String aeLevelConfigPayload;
+  serializeJson(aeLevelConfig, aeLevelConfigPayload);
+  client.publish(aeLevelConfigTopic.c_str(), aeLevelConfigPayload.c_str(), true);
+
+  // AEC Value Number (0..1200 typical OV2640 range)
+  String aecValueConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/aec_value/config";
+  DynamicJsonDocument aecValueConfig(capacity);
+  aecValueConfig["name"] = "Camera AEC Value";
+  aecValueConfig["command_topic"] = "catflap/aec_value/set";
+  aecValueConfig["state_topic"] = "catflap/aec_value";
+  aecValueConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_aec_value";
+  aecValueConfig["min"] = 0;
+  aecValueConfig["max"] = 1200;
+  aecValueConfig["step"] = 1;
+  JsonObject deviceInfoAecValue = aecValueConfig.createNestedObject("device");
+  deviceInfoAecValue["identifiers"] = DEVICE_UNIQUE_ID;
+  String aecValueConfigPayload;
+  serializeJson(aecValueConfig, aecValueConfigPayload);
+  client.publish(aecValueConfigTopic.c_str(), aecValueConfigPayload.c_str(), true);
+
+  // Exposure Ctrl Switch (AEC enable)
+  String exposureCtrlConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/exposure_ctrl/config";
+  DynamicJsonDocument exposureCtrlConfig(capacity);
+  exposureCtrlConfig["name"] = "Camera Auto Exposure";
+  exposureCtrlConfig["command_topic"] = "catflap/exposure_ctrl/set";
+  exposureCtrlConfig["state_topic"] = "catflap/exposure_ctrl";
+  exposureCtrlConfig["payload_on"] = "ON";
+  exposureCtrlConfig["payload_off"] = "OFF";
+  exposureCtrlConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_exposure_ctrl";
+  JsonObject deviceInfoExposureCtrl = exposureCtrlConfig.createNestedObject("device");
+  deviceInfoExposureCtrl["identifiers"] = DEVICE_UNIQUE_ID;
+  String exposureCtrlConfigPayload;
+  serializeJson(exposureCtrlConfig, exposureCtrlConfigPayload);
+  client.publish(exposureCtrlConfigTopic.c_str(), exposureCtrlConfigPayload.c_str(), true);
+
+  // AEC2 Switch (advanced exposure)
+  String aec2ConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/aec2/config";
+  DynamicJsonDocument aec2Config(capacity);
+  aec2Config["name"] = "Camera AEC2";
+  aec2Config["command_topic"] = "catflap/aec2/set";
+  aec2Config["state_topic"] = "catflap/aec2";
+  aec2Config["payload_on"] = "ON";
+  aec2Config["payload_off"] = "OFF";
+  aec2Config["unique_id"] = String(DEVICE_UNIQUE_ID) + "_aec2";
+  JsonObject deviceInfoAec2 = aec2Config.createNestedObject("device");
+  deviceInfoAec2["identifiers"] = DEVICE_UNIQUE_ID;
+  String aec2ConfigPayload;
+  serializeJson(aec2Config, aec2ConfigPayload);
+  client.publish(aec2ConfigTopic.c_str(), aec2ConfigPayload.c_str(), true);
+
+  // Gain Ctrl Switch (AGC enable)
+  String gainCtrlConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/gain_ctrl/config";
+  DynamicJsonDocument gainCtrlConfig(capacity);
+  gainCtrlConfig["name"] = "Camera Auto Gain";
+  gainCtrlConfig["command_topic"] = "catflap/gain_ctrl/set";
+  gainCtrlConfig["state_topic"] = "catflap/gain_ctrl";
+  gainCtrlConfig["payload_on"] = "ON";
+  gainCtrlConfig["payload_off"] = "OFF";
+  gainCtrlConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_gain_ctrl";
+  JsonObject deviceInfoGainCtrl = gainCtrlConfig.createNestedObject("device");
+  deviceInfoGainCtrl["identifiers"] = DEVICE_UNIQUE_ID;
+  String gainCtrlConfigPayload;
+  serializeJson(gainCtrlConfig, gainCtrlConfigPayload);
+  client.publish(gainCtrlConfigTopic.c_str(), gainCtrlConfigPayload.c_str(), true);
+
+  // AGC Gain Number (0..30 typical)
+  String agcGainConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/agc_gain/config";
+  DynamicJsonDocument agcGainConfig(capacity);
+  agcGainConfig["name"] = "Camera AGC Gain";
+  agcGainConfig["command_topic"] = "catflap/agc_gain/set";
+  agcGainConfig["state_topic"] = "catflap/agc_gain";
+  agcGainConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_agc_gain";
+  agcGainConfig["min"] = 0;
+  agcGainConfig["max"] = 30;
+  agcGainConfig["step"] = 1;
+  JsonObject deviceInfoAgcGain = agcGainConfig.createNestedObject("device");
+  deviceInfoAgcGain["identifiers"] = DEVICE_UNIQUE_ID;
+  String agcGainConfigPayload;
+  serializeJson(agcGainConfig, agcGainConfigPayload);
+  client.publish(agcGainConfigTopic.c_str(), agcGainConfigPayload.c_str(), true);
+
   // Brightness Number
   String brightnessConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/brightness/config";
   DynamicJsonDocument brightnessConfig(capacity);
@@ -906,7 +1035,7 @@ void publishDiscoveryConfigs() {
   // Snapshot Button
   String snapshotButtonConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/button/" + DEVICE_NAME + "/snapshot/config";
   DynamicJsonDocument snapshotButtonConfig(capacity);
-  snapshotButtonConfig["name"] = "Camera Snapshot";
+  snapshotButtonConfig["name"] = "Snapshot";
   snapshotButtonConfig["command_topic"] = COMMAND_TOPIC;
   snapshotButtonConfig["payload_press"] = "snapshot";
   snapshotButtonConfig["icon"] = "mdi:camera-iris";
@@ -1268,6 +1397,99 @@ void handleCooldownCommand(String cooldownStr) {
   publishCooldownState();
 }
 
+void handleAeLevelCommand(String levelStr) {
+  int level = levelStr.toInt();
+  if (level < -2 || level > 2) {
+    mqttDebugPrintln("Invalid AE level value");
+    return;
+  }
+
+  sensor_t * s = esp_camera_sensor_get();
+  if (s != NULL) {
+    s->set_ae_level(s, level);
+    mqttDebugPrintln("AE level updated");
+    client.publish("catflap/ae_level", String(level).c_str(), true);
+    lastSettingsChangeTime = millis();
+  } else {
+    mqttDebugPrintln("Failed to get camera sensor");
+  }
+}
+
+void handleAecValueCommand(String valueStr) {
+  int value = valueStr.toInt();
+  if (value < 0 || value > 1200) {
+    mqttDebugPrintln("Invalid AEC value");
+    return;
+  }
+
+  sensor_t * s = esp_camera_sensor_get();
+  if (s != NULL) {
+    s->set_aec_value(s, value);
+    mqttDebugPrintln("AEC value updated");
+    client.publish("catflap/aec_value", String(value).c_str(), true);
+    lastSettingsChangeTime = millis();
+  } else {
+    mqttDebugPrintln("Failed to get camera sensor");
+  }
+}
+
+void handleExposureCtrlCommand(String stateStr) {
+  bool enabled = stateStr.equalsIgnoreCase("ON");
+  sensor_t * s = esp_camera_sensor_get();
+  if (s != NULL) {
+    s->set_exposure_ctrl(s, enabled ? 1 : 0);
+    mqttDebugPrintln("Exposure control updated");
+    client.publish("catflap/exposure_ctrl", enabled ? "ON" : "OFF", true);
+    lastSettingsChangeTime = millis();
+  } else {
+    mqttDebugPrintln("Failed to get camera sensor");
+  }
+}
+
+void handleAec2Command(String stateStr) {
+  bool enabled = stateStr.equalsIgnoreCase("ON");
+  sensor_t * s = esp_camera_sensor_get();
+  if (s != NULL) {
+    s->set_aec2(s, enabled ? 1 : 0);
+    mqttDebugPrintln("AEC2 updated");
+    client.publish("catflap/aec2", enabled ? "ON" : "OFF", true);
+    lastSettingsChangeTime = millis();
+  } else {
+    mqttDebugPrintln("Failed to get camera sensor");
+  }
+}
+
+void handleGainCtrlCommand(String stateStr) {
+  bool enabled = stateStr.equalsIgnoreCase("ON");
+  sensor_t * s = esp_camera_sensor_get();
+  if (s != NULL) {
+    s->set_gain_ctrl(s, enabled ? 1 : 0);
+    mqttDebugPrintln("Gain control updated");
+    client.publish("catflap/gain_ctrl", enabled ? "ON" : "OFF", true);
+    lastSettingsChangeTime = millis();
+  } else {
+    mqttDebugPrintln("Failed to get camera sensor");
+  }
+}
+
+void handleAgcGainCommand(String valueStr) {
+  int value = valueStr.toInt();
+  if (value < 0 || value > 30) {
+    mqttDebugPrintln("Invalid AGC gain value");
+    return;
+  }
+
+  sensor_t * s = esp_camera_sensor_get();
+  if (s != NULL) {
+    s->set_agc_gain(s, value);
+    mqttDebugPrintln("AGC gain updated");
+    client.publish("catflap/agc_gain", String(value).c_str(), true);
+    lastSettingsChangeTime = millis();
+  } else {
+    mqttDebugPrintln("Failed to get camera sensor");
+  }
+}
+
 void handleIRBarrierStateChange(bool barrierBroken) {
   unsigned long currentTime = millis();
   if (barrierBroken) {
@@ -1338,6 +1560,14 @@ void publishCameraSettings() {
       default: effectStr = "Unknown"; break;
     }
     client.publish("catflap/special_effect", effectStr.c_str(), true);
+
+    // Publish additional camera controls
+    client.publish("catflap/ae_level", String(s->status.ae_level).c_str(), true);
+    client.publish("catflap/aec_value", String(s->status.aec_value).c_str(), true);
+    client.publish("catflap/exposure_ctrl", s->status.aec ? "ON" : "OFF", true);
+    client.publish("catflap/aec2", s->status.aec2 ? "ON" : "OFF", true);
+    client.publish("catflap/gain_ctrl", s->status.agc ? "ON" : "OFF", true);
+    client.publish("catflap/agc_gain", String(s->status.agc_gain).c_str(), true);
 
     // Publish other settings as needed
   }
@@ -1516,6 +1746,13 @@ void saveSettingsToEEPROM() {
     EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 4, s->status.saturation);
     EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 5, s->status.awb ? 1 : 0);
     EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 6, s->status.special_effect);
+    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 7, (int8_t)s->status.ae_level);
+    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 8, (uint8_t)(s->status.aec_value & 0xFF));
+    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 9, (uint8_t)((s->status.aec_value >> 8) & 0xFF));
+    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 10, s->status.aec ? 1 : 0);
+    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 11, s->status.aec2 ? 1 : 0);
+    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 12, s->status.agc ? 1 : 0);
+    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 13, s->status.agc_gain);
   }
 
   EEPROM.commit();
@@ -1624,6 +1861,62 @@ void loadSettingsFromEEPROM() {
     } else {
       mqttDebugPrintln("Invalid special effect in EEPROM. Setting to default (No Effect).");
       s->set_special_effect(s, 0);  // Default value
+    }
+
+    // AE Level
+    int8_t aeLevelValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 7);
+    if (aeLevelValue >= -2 && aeLevelValue <= 2) {
+      s->set_ae_level(s, aeLevelValue);
+    } else {
+      mqttDebugPrintln("Invalid AE level in EEPROM. Setting to default (0).");
+      s->set_ae_level(s, 0);
+    }
+
+    // AEC Value (two bytes, little-endian)
+    uint8_t aecLo = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 8);
+    uint8_t aecHi = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 9);
+    uint16_t aecValue = (uint16_t)aecLo | ((uint16_t)aecHi << 8);
+    if (aecValue <= 1200) {
+      s->set_aec_value(s, aecValue);
+    } else {
+      mqttDebugPrintln("Invalid AEC value in EEPROM. Setting to default (0).");
+      s->set_aec_value(s, 0);
+    }
+
+    // Exposure Control (AEC enable)
+    uint8_t exposureCtrlValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 10);
+    if (exposureCtrlValue == 0 || exposureCtrlValue == 1) {
+      s->set_exposure_ctrl(s, exposureCtrlValue == 1);
+    } else {
+      mqttDebugPrintln("Invalid exposure control in EEPROM. Setting to default (enabled).");
+      s->set_exposure_ctrl(s, 1);
+    }
+
+    // AEC2
+    uint8_t aec2Value = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 11);
+    if (aec2Value == 0 || aec2Value == 1) {
+      s->set_aec2(s, aec2Value == 1);
+    } else {
+      mqttDebugPrintln("Invalid AEC2 in EEPROM. Setting to default (disabled).");
+      s->set_aec2(s, 0);
+    }
+
+    // Gain Control (AGC enable)
+    uint8_t gainCtrlValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 12);
+    if (gainCtrlValue == 0 || gainCtrlValue == 1) {
+      s->set_gain_ctrl(s, gainCtrlValue == 1);
+    } else {
+      mqttDebugPrintln("Invalid gain control in EEPROM. Setting to default (enabled).");
+      s->set_gain_ctrl(s, 1);
+    }
+
+    // AGC Gain
+    uint8_t agcGainValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 13);
+    if (agcGainValue <= 30) {
+      s->set_agc_gain(s, agcGainValue);
+    } else {
+      mqttDebugPrintln("Invalid AGC gain in EEPROM. Setting to default (0).");
+      s->set_agc_gain(s, 0);
     }
 
     mqttDebugPrintln("Camera settings loaded from EEPROM.");
