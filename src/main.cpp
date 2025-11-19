@@ -147,6 +147,7 @@ bool mqttDebugEnabled = true;
 bool catLocation = true; // true = home
 bool barrierTriggered = false;  // Flag to indicate barrier has been triggered
 bool barrierStableState = false; // Last confirmed stable state (false = not broken, true = broken)
+esp_err_t cameraInitStatus = ESP_FAIL;
 
 // Timer for saving settings
 unsigned long lastSettingsChangeTime = 0;
@@ -179,7 +180,7 @@ static uint32_t g_lastPulseCheckMs = 0;       // last time we checked pulse coun
 void setup() {
   Serial.begin(115200);
 
-  esp_err_t cameraInitStatus = initCamera();
+  cameraInitStatus = initCamera();
   
   // Initialize EEPROM
   EEPROM.begin(EEPROM_SIZE);
@@ -514,7 +515,12 @@ esp_err_t initCamera() {
 }
 
 void captureAndSendImage() {
+  if (cameraInitStatus != ESP_OK) {
+    mqttDebugPrintln("captureAndSendImage: camera not initialized");
+    return;
+  }
   roundTripTimer = millis();
+  g_irSensingEnabled = false;  // mask while IR is off
   ir_off();  // Turn off IR during image capture
   delay(5); // Short delay to allow camera to adjust to lighting change. Increase if IR bleed shines through
   camera_fb_t * fb = esp_camera_fb_get();
@@ -1267,7 +1273,7 @@ void handleIRBarrierStateChange(bool barrierBroken) {
 
       // Publish IR barrier state
       client.publish(IR_BARRIER_TOPIC, "broken", true);
-
+      
       captureAndSendImage();
 
     } else {
