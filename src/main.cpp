@@ -106,6 +106,8 @@ void ir_init();
 void ir_on();
 void ir_off();
 void ir_burst();
+void irDisableForCritical();
+void irEnableAfterCritical();
 void setup_wifi();
 void mqttConnect();
 void mqttReconnect();
@@ -192,7 +194,7 @@ unsigned long sendEndTime = 0;           // after MQTT image publish
 
 // Debounce and Cooldown Settings
 float cooldownDuration = 0.0;    // Cooldown duration in seconds (default to 0)
-unsigned long lastTriggerTime = 0;     // Timestamp of the last valid trigger
+unsigned long lastBarrierClearedTime = 0;     // Timestamp of the last valid trigger
 unsigned long lastIrDebug = 0;
 
 uint8_t activeCameraPreset = 0; // 0 = day, 1 = night
@@ -364,6 +366,22 @@ inline IrState readIrRaw()
   return lastReading;
 }
 
+void irDisableForCritical() {
+  detachInterrupt(digitalPinToInterrupt(IR_PIN));
+  g_irSensingEnabled = false;
+}
+
+void irEnableAfterCritical() {
+  g_pulseCount = 0;
+  uint32_t now = millis();
+  g_lastPulseCheckMs = now;
+  g_candidate = g_stable;
+  g_lastChangeMs = now;
+  g_lastStableMs = now;
+  g_irSensingEnabled = true;
+  attachInterrupt(digitalPinToInterrupt(IR_PIN), ir_falling_isr, FALLING);
+}
+
 void checkResetReason() {
   esp_reset_reason_t reason = esp_reset_reason();
 
@@ -396,6 +414,7 @@ bool isEEPROMInitialized() {
 
 void initializeEEPROM() {
   mqttDebugPrintln("Initializing EEPROM with default settings...");
+  irDisableForCritical();
   
   // Write the current version to EEPROM
   EEPROM.write(EEPROM_ADDRESS_VERSION, EEPROM_VERSION);
@@ -434,6 +453,8 @@ void initializeEEPROM() {
   activeCameraPreset = 0;
   EEPROM.write(EEPROM_ADDRESS_ACTIVE_PRESET, activeCameraPreset);
   EEPROM.commit();
+
+  irEnableAfterCritical();
 }
 
 void setup_wifi() {
@@ -575,16 +596,15 @@ void captureAndSendImage() {
     return;
   }
   captureStartTime = millis();
-  //g_irSensingEnabled = false;  // mask while IR is off
+  irDisableForCritical();
   ir_off();  // Turn off IR during image capture
   delay(5); // Short delay to allow camera to adjust to lighting change. Increase if IR bleed shines through
   camera_fb_t * fb = esp_camera_fb_get();
   
-  g_irSensingEnabled = true;   // unmask after carrier resumes
-
   esp_camera_fb_return(fb);
   fb = esp_camera_fb_get();
   ir_on(); // Turn IR back on after image capture
+  irEnableAfterCritical();
   if (!fb) {
     Serial.println("Camera capture failed");
     mqttDebugPrintln("Camera capture failed");
@@ -1596,7 +1616,7 @@ void handleAgcGainCommand(String valueStr) {
 void handleIRBarrierStateChange(bool barrierBroken) {
   unsigned long currentTime = millis();
   if (barrierBroken) {
-    if (currentTime - lastTriggerTime >= (cooldownDuration * 1000)) {
+    if (currentTime - lastBarrierClearedTime >= (cooldownDuration * 1000)) {
 
       // Mark start of trigger chain (barrier -> inference)
       triggerStartTime = currentTime;
@@ -1611,7 +1631,7 @@ void handleIRBarrierStateChange(bool barrierBroken) {
     }
   } else {
     // Update on falling edge
-    lastTriggerTime = currentTime;
+    lastBarrierClearedTime = currentTime;
 
     // Publish IR barrier state
     client.publish(IR_BARRIER_TOPIC, "clear", true);
@@ -1830,6 +1850,8 @@ void setupOTA() {
 void saveSettingsToEEPROM() {
   mqttDebugPrintln("Saving settings to EEPROM...");
 
+  irDisableForCritical();
+
   // Save the version number
   EEPROM.write(EEPROM_ADDRESS_VERSION, EEPROM_VERSION);
 
@@ -1861,6 +1883,8 @@ void saveSettingsToEEPROM() {
   }
 
   EEPROM.commit();
+
+  irEnableAfterCritical();
 }
 
 
@@ -2050,6 +2074,8 @@ void savePresetToEEPROM(uint8_t presetIndex) {
     return;
   }
 
+  irDisableForCritical();
+
   EEPROM.write(base + 0, s->status.framesize);
   EEPROM.write(base + 1, s->status.quality);
   EEPROM.write(base + 2, s->status.brightness);
@@ -2066,6 +2092,8 @@ void savePresetToEEPROM(uint8_t presetIndex) {
   EEPROM.write(base + 13, s->status.agc_gain);
 
   EEPROM.commit();
+
+  irEnableAfterCritical();
 }
 
 // Helper: apply a preset from EEPROM to the sensor
@@ -2176,8 +2204,10 @@ void handleCameraPresetSelect(String presetStr) {
   }
 
   activeCameraPreset = newPreset;
+  irDisableForCritical();
   EEPROM.write(EEPROM_ADDRESS_ACTIVE_PRESET, activeCameraPreset);
   EEPROM.commit();
+  irEnableAfterCritical();
 
   applyPresetFromEEPROM(activeCameraPreset);
 
