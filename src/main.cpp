@@ -183,7 +183,12 @@ const unsigned long DIAGNOSTIC_UPDATE_INTERVAL = 15000;
 unsigned long loopStartTime = 0;
 unsigned long loopDurationSum = 0;
 unsigned long loopCount = 0;
-unsigned long roundTripTimer = 0;
+
+// Timing for full trigger -> capture -> send -> inference chain
+unsigned long triggerStartTime = 0;      // IR barrier becomes stably broken
+unsigned long captureStartTime = 0;      // captureAndSendImage() entry
+unsigned long captureEndTime = 0;        // after successful capture
+unsigned long sendEndTime = 0;           // after MQTT image publish
 
 // Debounce and Cooldown Settings
 float cooldownDuration = 0.0;    // Cooldown duration in seconds (default to 0)
@@ -569,16 +574,17 @@ void captureAndSendImage() {
     mqttDebugPrintln("captureAndSendImage: camera not initialized");
     return;
   }
-  roundTripTimer = millis();
+  captureStartTime = millis();
   //g_irSensingEnabled = false;  // mask while IR is off
   ir_off();  // Turn off IR during image capture
   delay(5); // Short delay to allow camera to adjust to lighting change. Increase if IR bleed shines through
   camera_fb_t * fb = esp_camera_fb_get();
-  ir_on(); // Turn IR back on after image capture
+  
   g_irSensingEnabled = true;   // unmask after carrier resumes
 
   esp_camera_fb_return(fb);
   fb = esp_camera_fb_get();
+  ir_on(); // Turn IR back on after image capture
   if (!fb) {
     Serial.println("Camera capture failed");
     mqttDebugPrintln("Camera capture failed");
@@ -587,6 +593,8 @@ void captureAndSendImage() {
   }
 
   mqttDebugPrintf("Image size: %u bytes\n", fb->len);
+
+  captureEndTime = millis();
 
   // Publish the image over MQTT
   if (client.connected()) {
@@ -597,7 +605,7 @@ void captureAndSendImage() {
       mqttDebugPrintln("Image failed to send via mqtt");
     }
   }
-
+  sendEndTime = millis();
   esp_camera_fb_return(fb);
 }
 
@@ -628,6 +636,7 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
 
   if (String(topic) == COMMAND_TOPIC) {
     if (incomingMessage.equalsIgnoreCase("snapshot")) {
+      triggerStartTime = millis();
       captureAndSendImage();
     } else if (incomingMessage.equalsIgnoreCase("restart")) {
       ESP.restart();
@@ -757,7 +766,7 @@ void publishDiscoveryConfigs() {
   // Flap Control Switch
   String flapSwitchConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/flap_state/config";
   DynamicJsonDocument flapSwitchConfig(capacity);
-  flapSwitchConfig["name"] = "Enable Cat Flap";
+  flapSwitchConfig["name"] = "Allow Entry";
   flapSwitchConfig["command_topic"] = SET_FLAP_STATE_TOPIC;
   flapSwitchConfig["state_topic"] = FLAP_STATE_TOPIC;
   flapSwitchConfig["payload_on"] = "ON";
@@ -880,7 +889,7 @@ void publishDiscoveryConfigs() {
   // AE Level Number (-2..2)
   String aeLevelConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/ae_level/config";
   DynamicJsonDocument aeLevelConfig(capacity);
-  aeLevelConfig["name"] = "Camera AE Level";
+  aeLevelConfig["name"] = "AE Level";
   aeLevelConfig["command_topic"] = "catflap/ae_level/set";
   aeLevelConfig["state_topic"] = "catflap/ae_level";
   aeLevelConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_ae_level";
@@ -896,7 +905,7 @@ void publishDiscoveryConfigs() {
   // AEC Value Number (0..1200 typical OV2640 range)
   String aecValueConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/aec_value/config";
   DynamicJsonDocument aecValueConfig(capacity);
-  aecValueConfig["name"] = "Camera AEC Value";
+  aecValueConfig["name"] = "AE Value";
   aecValueConfig["command_topic"] = "catflap/aec_value/set";
   aecValueConfig["state_topic"] = "catflap/aec_value";
   aecValueConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_aec_value";
@@ -912,7 +921,7 @@ void publishDiscoveryConfigs() {
   // Exposure Ctrl Switch (AEC enable)
   String exposureCtrlConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/exposure_ctrl/config";
   DynamicJsonDocument exposureCtrlConfig(capacity);
-  exposureCtrlConfig["name"] = "Camera Auto Exposure";
+  exposureCtrlConfig["name"] = "AE Auto Exposure";
   exposureCtrlConfig["command_topic"] = "catflap/exposure_ctrl/set";
   exposureCtrlConfig["state_topic"] = "catflap/exposure_ctrl";
   exposureCtrlConfig["payload_on"] = "ON";
@@ -927,7 +936,7 @@ void publishDiscoveryConfigs() {
   // AEC2 Switch (advanced exposure)
   String aec2ConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/aec2/config";
   DynamicJsonDocument aec2Config(capacity);
-  aec2Config["name"] = "Camera AEC2";
+  aec2Config["name"] = "AE Advanced";
   aec2Config["command_topic"] = "catflap/aec2/set";
   aec2Config["state_topic"] = "catflap/aec2";
   aec2Config["payload_on"] = "ON";
@@ -942,7 +951,7 @@ void publishDiscoveryConfigs() {
   // Gain Ctrl Switch (AGC enable)
   String gainCtrlConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/gain_ctrl/config";
   DynamicJsonDocument gainCtrlConfig(capacity);
-  gainCtrlConfig["name"] = "Camera Auto Gain";
+  gainCtrlConfig["name"] = "AG Auto Gain";
   gainCtrlConfig["command_topic"] = "catflap/gain_ctrl/set";
   gainCtrlConfig["state_topic"] = "catflap/gain_ctrl";
   gainCtrlConfig["payload_on"] = "ON";
@@ -957,7 +966,7 @@ void publishDiscoveryConfigs() {
   // AGC Gain Number (0..30 typical)
   String agcGainConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/agc_gain/config";
   DynamicJsonDocument agcGainConfig(capacity);
-  agcGainConfig["name"] = "Camera AGC Gain";
+  agcGainConfig["name"] = "AG Gain";
   agcGainConfig["command_topic"] = "catflap/agc_gain/set";
   agcGainConfig["state_topic"] = "catflap/agc_gain";
   agcGainConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_agc_gain";
@@ -973,7 +982,7 @@ void publishDiscoveryConfigs() {
   // Camera Preset Select (day/night)
   String cameraPresetConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/select/" + DEVICE_NAME + "/camera_preset/config";
   DynamicJsonDocument cameraPresetConfig(capacity);
-  cameraPresetConfig["name"] = "Camera Preset";
+  cameraPresetConfig["name"] = "Preset";
   cameraPresetConfig["command_topic"] = SET_CAMERA_PRESET_TOPIC;
   cameraPresetConfig["state_topic"] = CAMERA_PRESET_TOPIC;
   cameraPresetConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_camera_preset";
@@ -990,7 +999,7 @@ void publishDiscoveryConfigs() {
   // Camera Preset Save Button (save current settings to selected preset)
   String cameraPresetSaveConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/button/" + DEVICE_NAME + "/camera_preset_save/config";
   DynamicJsonDocument cameraPresetSaveConfig(capacity);
-  cameraPresetSaveConfig["name"] = "Save Camera Preset";
+  cameraPresetSaveConfig["name"] = "Preset Save";
   cameraPresetSaveConfig["command_topic"] = SET_CAMERA_PRESET_SAVE_TOPIC;
   cameraPresetSaveConfig["payload_press"] = "save";
   cameraPresetSaveConfig["icon"] = "mdi:content-save";
@@ -1255,7 +1264,9 @@ void publishDiscoveryConfigs() {
 }
 
 void handleInferenceTopic(String inferenceStr) {
-  client.publish(ROUNDTRIP_TOPIC, String(millis()-roundTripTimer).c_str(), true);
+  unsigned long now = millis();
+  
+  //handle response first
   if (inferenceStr == "not_cat"){
     /* code */
   } else if (inferenceStr == "cat_morris_entering") {
@@ -1268,6 +1279,39 @@ void handleInferenceTopic(String inferenceStr) {
   } else if (inferenceStr == "prey") {
     if(detectionModeEnabled) handleFlapStateCommand("OFF");
   }
+
+  unsigned long barrierToStartCapture = 0;
+  unsigned long captureDuration = 0;
+  unsigned long sendDuration = 0;
+  unsigned long inferenceLatency = 0;
+  unsigned long totalDuration = 0;
+
+  if (triggerStartTime > 0 && captureStartTime >= triggerStartTime) {
+    barrierToStartCapture = captureStartTime - triggerStartTime;
+  }
+  if (captureEndTime >= captureStartTime && captureStartTime > 0) {
+    captureDuration = captureEndTime - captureStartTime;
+  }
+  if (sendEndTime >= captureEndTime && captureEndTime > 0) {
+    sendDuration = sendEndTime - captureEndTime;
+  }
+  if (now >= sendEndTime && sendEndTime > 0) {
+    inferenceLatency = now - sendEndTime;
+  }
+  if (triggerStartTime > 0 && now >= triggerStartTime) {
+    totalDuration = now - triggerStartTime;
+  }
+
+  mqttDebugPrintf(
+      "[TIMER] barrier_to_start_capture_ms=%lu, capture_duration_ms=%lu, send_duration_ms=%lu, inference_latency_ms=%lu, total_ms=%lu\n",
+      (unsigned long)barrierToStartCapture,
+      (unsigned long)captureDuration,
+      (unsigned long)sendDuration,
+      (unsigned long)inferenceLatency,
+      (unsigned long)totalDuration);
+
+  // Publish total duration as roundtrip metric
+  client.publish(ROUNDTRIP_TOPIC, String(totalDuration).c_str(), true);
 }
 
 void handleDetectionModeCommand(String stateStr) {
@@ -1554,6 +1598,9 @@ void handleIRBarrierStateChange(bool barrierBroken) {
   if (barrierBroken) {
     if (currentTime - lastTriggerTime >= (cooldownDuration * 1000)) {
 
+      // Mark start of trigger chain (barrier -> inference)
+      triggerStartTime = currentTime;
+
       // Publish IR barrier state
       client.publish(IR_BARRIER_TOPIC, "broken", true);
       
@@ -1720,7 +1767,6 @@ void updateIRBarrierState()
   if (reading != g_candidate) {
     g_candidate = reading;
     g_lastChangeMs = now;                  // start debounce window
-    //mqttDebugPrintln("Potential state change detected. Debouncing...");
     return;
   }
 
@@ -2137,7 +2183,8 @@ void handleCameraPresetSelect(String presetStr) {
 
   // Publish preset state
   client.publish(CAMERA_PRESET_TOPIC, activeCameraPreset == 0 ? "day" : "night", true);
-  mqttDebugPrintln("Camera preset applied");
+  publishCameraSettings();
+  mqttDebugPrintf("Camera preset %s applied", activeCameraPreset == 0 ? "day" : "night");
 
   lastSettingsChangeTime = millis();
 }
