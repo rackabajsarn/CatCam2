@@ -65,7 +65,6 @@ const char* password = WIFI_PASSWORD;
 #define SET_JPEG_QUALITY_TOPIC "catflap/jpeg_quality/set"
 #define SET_BRIGHTNESS_TOPIC "catflap/brightness/set"
 #define SET_CONTRAST_TOPIC "catflap/contrast/set"
-#define SET_SATURATION_TOPIC "catflap/saturation/set"
 #define SET_AWB_TOPIC "catflap/awb/set"
 #define MODEL_SOURCE_TOPIC "catflap/model_source"
 #define SET_MODEL_SOURCE_TOPIC "catflap/model_source/set"
@@ -81,7 +80,7 @@ const char* password = WIFI_PASSWORD;
 
 // EEPROM Addresses
 #define EEPROM_SIZE 160
-#define EEPROM_VERSION 5  // Increment this number whenever you change the EEPROM layout
+#define EEPROM_VERSION 6  // Increment this number whenever you change the EEPROM layout
 #define EEPROM_ADDRESS_VERSION 0
 #define EEPROM_ADDRESS_DETECTION_MODE 1
 #define EEPROM_ADDR_COOLDOWN 2
@@ -127,13 +126,6 @@ const char* password = WIFI_PASSWORD;
 #define PCLK_GPIO_NUM    22
 
 
-// Structure to accumulate JPEG data
-typedef struct {
-  uint8_t *buf;      // Pointer to output buffer
-  size_t buf_size;   // Total allocated size
-  size_t offset;     // Current offset (number of bytes written)
-} jpg_chunk_t;
-
 // Forward declarations of functions
 void IRAM_ATTR ir_falling_isr();
 void checkResetReason();
@@ -153,7 +145,7 @@ void mqttInitialPublish();
 esp_err_t initCamera();
 void captureAndSendImage();
 void processCroppedAndConvert(camera_fb_t *cropped);
-unsigned int jpgOutputCallback(void *arg, size_t index, const void *data, size_t len);
+
 camera_fb_t* cropImage(camera_fb_t *fb);
 camera_fb_t* resizeImage(camera_fb_t *cropped, int originalSize, int targetSize);
 camera_fb_t* cropFrame(camera_fb_t *fb);
@@ -554,9 +546,9 @@ bool isEEPROMInitialized() {
 
 void initializeEEPROM() {
   mqttDebugPrintln("Initializing EEPROM with default settings...");
-  irDisableForCritical();
   
   // Write the current version to EEPROM
+  // This write is buffered and will be committed by saveSettingsToEEPROM()
   EEPROM.write(EEPROM_ADDRESS_VERSION, EEPROM_VERSION);
   
   // Initialize settings to default values
@@ -571,29 +563,43 @@ void initializeEEPROM() {
     s->set_quality(s, 10);
     s->set_brightness(s, -2);
     s->set_contrast(s, 1);
-    s->set_saturation(s, 0);
     s->set_whitebal(s, true);
-    s->set_special_effect(s, 2);
     s->set_ae_level(s, 0);
     s->set_aec_value(s, 0);
     s->set_exposure_ctrl(s, 1); // auto exposure on
-    s->set_aec2(s, 0);          // extra AEC off
+    s->set_aec2(s, 1);          // extra AEC off
     s->set_gain_ctrl(s, 1);     // auto gain on
     s->set_agc_gain(s, 0);
   }
+  savePresetToEEPROM(0); // day
 
+  if (s != NULL) {
+    s->set_framesize(s, FRAMESIZE_VGA);
+    s->set_quality(s, 10);
+    s->set_brightness(s, -2);
+    s->set_contrast(s, 1);
+    s->set_whitebal(s, false);
+    s->set_ae_level(s, 0);
+    s->set_aec_value(s, 100);
+    s->set_exposure_ctrl(s, 0); // auto exposure on
+    s->set_aec2(s, 0);          // extra AEC off
+    s->set_gain_ctrl(s, 0);     // auto gain on
+    s->set_agc_gain(s, 5);
+  }
   // Save default settings to EEPROM
+  // This handles its own critical section and commits the version write above too
   saveSettingsToEEPROM();
 
-  // Initialize presets: copy current camera settings into both day and night
-  savePresetToEEPROM(0); // day
+  // Initialize presets: copy current camera settings into both day and night 
+  // TODO: individualize these defaults
+  
   savePresetToEEPROM(1); // night
 
   // Default active preset: day
+  irDisableForCritical();
   activeCameraPreset = 0;
   EEPROM.write(EEPROM_ADDRESS_ACTIVE_PRESET, activeCameraPreset);
   EEPROM.commit();
-
   irEnableAfterCritical();
 }
 
@@ -666,7 +672,6 @@ void mqttSubscribe() {
     client.subscribe(SET_JPEG_QUALITY_TOPIC);
     client.subscribe(SET_BRIGHTNESS_TOPIC);
     client.subscribe(SET_CONTRAST_TOPIC);
-    client.subscribe(SET_SATURATION_TOPIC);
     client.subscribe(SET_AWB_TOPIC);
     client.subscribe(SET_EXPOSURE_CTRL_TOPIC);
     client.subscribe(SET_AEC_VALUE_TOPIC);
@@ -870,61 +875,35 @@ bool run_inference(uint8_t* input_data, size_t input_data_size) {
   return preyDetected;
 }
 
-// Example callback function for frame2jpg_cb.
-// This function will be called repeatedly with chunks of JPEG data.
-unsigned int jpgOutputCallback(void *arg, size_t index, const void *data, size_t len) {
-  jpg_chunk_t *chunk = (jpg_chunk_t*) arg;
-  // Check if there is enough space in the buffer; you may choose to enlarge the buffer here.
-  if (chunk->offset + len > chunk->buf_size) {
-      // In this example, if the buffer is too small, we simply return 0 to signal an error.
-      Serial.println("Output buffer overflow");
-      return 0;
-  }
-  // Copy the data chunk into our output buffer.
-  memcpy(chunk->buf + chunk->offset, data, len);
-  chunk->offset += len;
-  // Return the number of bytes written.
-  return len;
-}
-
 // Function to process the cropped frame and convert it to JPEG.
 void processCroppedAndConvert(camera_fb_t *cropped) {
-  int quality = 12;  // Adjust quality as needed.
+  uint8_t *jpg_buf = NULL;
+  size_t jpg_len = 0;
   
-  // Prepare a structure to accumulate JPEG data.
-  // Choose an output buffer size large enough for your expected JPEG image.
-  size_t output_buffer_size = 20 * 1024; // e.g., 20KB (adjust as needed)
-  jpg_chunk_t jpgChunk;
-  jpgChunk.buf = (uint8_t*) malloc(output_buffer_size);
-  if (!jpgChunk.buf) {
-      Serial.println("Failed to allocate JPEG output buffer");
-      // Free cropped frame before returning.
-      heap_caps_free(cropped->buf);
-      heap_caps_free(cropped);
-      return;
+  // Convert the grayscale frame to JPEG
+  // Quality 12 is decent
+  bool converted = frame2jpg(cropped, 12, &jpg_buf, &jpg_len);
+  
+  // Free the original grayscale buffer (allocated in PSRAM)
+  if (cropped->buf) {
+    heap_caps_free(cropped->buf);
+    cropped->buf = NULL;
   }
-  jpgChunk.buf_size = output_buffer_size;
-  jpgChunk.offset = 0;
-  
-  // Call frame2jpg_cb on the cropped frame.
-  // The callback will be called repeatedly to fill our output buffer.
-  esp_err_t res = frame2jpg_cb(cropped, quality, jpgOutputCallback, &jpgChunk);
-  if (res != ESP_OK) {
-      Serial.printf("frame2jpg_cb failed: %d\n", res);
-      free(jpgChunk.buf);
-  } else {
-      Serial.printf("JPEG conversion succeeded, total %u bytes\n", jpgChunk.offset);
-      // At this point, jpgChunk.buf contains the JPEG data, with jpgChunk.offset bytes.
-      // You can now publish it via MQTT or store it as needed.
-      // For example:
-      // client.publish(IMAGE_TOPIC, jpgChunk.buf, jpgChunk.offset, true);
+
+  if (!converted) {
+    mqttDebugPrintln("JPEG compression failed");
+    cropped->len = 0;
+    cropped->format = PIXFORMAT_GRAYSCALE; // Invalid state really
+    return;
   }
+
+  // Update the struct to point to the new JPEG buffer
+  // Note: frame2jpg allocates using standard malloc (internal RAM usually)
+  cropped->buf = jpg_buf;
+  cropped->len = jpg_len;
+  cropped->format = PIXFORMAT_JPEG;
   
-  // Free resources.
-  free(jpgChunk.buf);
-  // Free the cropped frame memory.
-  if (cropped->buf) heap_caps_free(cropped->buf);
-  heap_caps_free(cropped);
+  mqttDebugPrintf("Converted to JPEG: %u bytes\n", jpg_len);
 }
 
 void captureAndSendImage() {
@@ -1001,6 +980,11 @@ void captureAndSendImage() {
     }
   }
   sendEndTime = millis();
+
+  // Free the cropped frame (now JPEG)
+  if (cropped->buf) free(cropped->buf); // frame2jpg uses standard malloc
+  heap_caps_free(cropped); // struct was in PSRAM
+
   esp_camera_fb_return(fb);
 }
 
@@ -1118,8 +1102,6 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
     handleBrightnessCommand(incomingMessage);
   } else if (String(topic) == SET_CONTRAST_TOPIC) {
     handleContrastCommand(incomingMessage);
-  } else if (String(topic) == SET_SATURATION_TOPIC) {
-    handleSaturationCommand(incomingMessage);
   } else if (String(topic) == SET_AWB_TOPIC) {
     handleAWBCommand(incomingMessage);
   } else if (String(topic) == SET_DETECTION_MODE_TOPIC) {
@@ -1495,23 +1477,6 @@ void publishDiscoveryConfigs() {
   serializeJson(contrastConfig, contrastConfigPayload);
   client.publish(contrastConfigTopic.c_str(), contrastConfigPayload.c_str(), true);
 
-  // Saturation Number
-  String saturationConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/saturation/config";
-  DynamicJsonDocument saturationConfig(capacity);
-  saturationConfig["name"] = "Camera Saturation";
-  saturationConfig["command_topic"] = "catflap/saturation/set";
-  //saturationConfig["entity_category"] = "configuration";
-  saturationConfig["state_topic"] = "catflap/saturation";
-  saturationConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_saturation";
-  saturationConfig["min"] = -2;
-  saturationConfig["max"] = 2;
-  saturationConfig["step"] = 1;
-  JsonObject deviceInfoSaturation = saturationConfig.createNestedObject("device");
-  deviceInfoSaturation["identifiers"] = DEVICE_UNIQUE_ID;
-  String saturationConfigPayload;
-  serializeJson(saturationConfig, saturationConfigPayload);
-  client.publish(saturationConfigTopic.c_str(), saturationConfigPayload.c_str(), true);
-
   // AWB Switch
   String awbConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/awb/config";
   DynamicJsonDocument awbConfig(capacity);
@@ -1827,24 +1792,6 @@ void handleContrastCommand(String contrastStr) {
   }
 }
 
-void handleSaturationCommand(String saturationStr) {
-  int saturation = saturationStr.toInt();
-  if (saturation < -2 || saturation > 2) {
-    mqttDebugPrintln("Invalid saturation value");
-    return;
-  }
-
-  sensor_t * s = esp_camera_sensor_get();
-  if (s != NULL) {
-    s->set_saturation(s, saturation);
-    mqttDebugPrintln("Saturation updated");
-    client.publish("catflap/saturation", String(saturation).c_str(), true);
-    lastSettingsChangeTime = millis();
-  } else {
-    mqttDebugPrintln("Failed to get camera sensor");
-  }
-}
-
 void handleAWBCommand(String awbStateStr) {
   bool awbState = awbStateStr.equalsIgnoreCase("ON");
   sensor_t * s = esp_camera_sensor_get();
@@ -2002,10 +1949,6 @@ void publishCameraSettings() {
     // Publish Contrast
     int contrast = s->status.contrast;
     client.publish("catflap/contrast", String(contrast).c_str(), true);
-
-    // Publish Saturation
-    int saturation = s->status.saturation;
-    client.publish("catflap/saturation", String(saturation).c_str(), true);
 
     // Publish AWB
     String awbState = s->status.awb ? "ON" : "OFF";
@@ -2298,13 +2241,13 @@ void saveSettingsToEEPROM() {
   // Save camera settings
   sensor_t * s = esp_camera_sensor_get();
   if (s != NULL) {
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 0, s->status.framesize); //TODO: remove
+    //EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 0, s->status.framesize); // Removed
     EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 1, s->status.quality);
     EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 2, s->status.brightness);
     EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 3, s->status.contrast);
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 4, s->status.saturation);
+    //EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 4, s->status.saturation); // Removed
     EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 5, s->status.awb ? 1 : 0);
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 6, s->status.special_effect); //TODO: remove
+    //EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 6, s->status.special_effect); // Removed
     EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 7, (int8_t)s->status.ae_level);
     EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 8, (uint8_t)(s->status.aec_value & 0xFF));
     EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 9, (uint8_t)((s->status.aec_value >> 8) & 0xFF));
@@ -2395,15 +2338,6 @@ void loadSettingsFromEEPROM() {
             s->set_contrast(s, 0);
         }
 
-        // Saturation
-        int8_t saturationValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 4);
-        if (saturationValue >= -2 && saturationValue <= 2) {
-            s->set_saturation(s, saturationValue);
-        } else {
-            mqttDebugPrintln("Invalid saturation in EEPROM. Setting to default (0).");
-            s->set_saturation(s, 0);
-        }
-
         // Automatic White Balance (AWB)
         uint8_t awbValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 5);
         if (awbValue <= 1) {
@@ -2412,15 +2346,6 @@ void loadSettingsFromEEPROM() {
             mqttDebugPrintln("Invalid AWB value in EEPROM. Setting to default (enabled).");
             s->set_whitebal(s, true);
         }
-
-    // Special Effect
-    uint8_t effectValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 6);
-    if (effectValue >= 0 && effectValue <= 6) {
-      s->set_special_effect(s, effectValue);
-    } else {
-      mqttDebugPrintln("Invalid special effect in EEPROM. Setting to default (No Effect).");
-      s->set_special_effect(s, 0);  // Default value
-    }
 
     // AE Level
     int8_t aeLevelValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 7);
@@ -2499,13 +2424,13 @@ void savePresetToEEPROM(uint8_t presetIndex) {
 
   irDisableForCritical();
 
-  EEPROM.write(base + 0, s->status.framesize);
+  //EEPROM.write(base + 0, s->status.framesize); // Removed
   EEPROM.write(base + 1, s->status.quality);
   EEPROM.write(base + 2, s->status.brightness);
   EEPROM.write(base + 3, s->status.contrast);
-  EEPROM.write(base + 4, s->status.saturation);
+  //EEPROM.write(base + 4, s->status.saturation); // Removed
   EEPROM.write(base + 5, s->status.awb ? 1 : 0);
-  EEPROM.write(base + 6, s->status.special_effect);
+  //EEPROM.write(base + 6, s->status.special_effect); // Removed
   EEPROM.write(base + 7, (int8_t)s->status.ae_level);
   EEPROM.write(base + 8, (uint8_t)(s->status.aec_value & 0xFF));
   EEPROM.write(base + 9, (uint8_t)((s->status.aec_value >> 8) & 0xFF));
@@ -2532,10 +2457,10 @@ void applyPresetFromEEPROM(uint8_t presetIndex) {
   }
 
   // Framesize
-  uint8_t framesizeValue = EEPROM.read(base + 0);
-  if (framesizeValue >= FRAMESIZE_QQVGA && framesizeValue <= FRAMESIZE_UXGA) {
-    s->set_framesize(s, (framesize_t)framesizeValue);
-  }
+  // uint8_t framesizeValue = EEPROM.read(base + 0);
+  // if (framesizeValue >= FRAMESIZE_QQVGA && framesizeValue <= FRAMESIZE_UXGA) {
+  //   s->set_framesize(s, (framesize_t)framesizeValue);
+  // }
 
   // JPEG Quality
   uint8_t qualityValue = EEPROM.read(base + 1);
@@ -2555,22 +2480,10 @@ void applyPresetFromEEPROM(uint8_t presetIndex) {
     s->set_contrast(s, contrastValue);
   }
 
-  // Saturation
-  int8_t saturationValue = (int8_t)EEPROM.read(base + 4);
-  if (saturationValue >= -2 && saturationValue <= 2) {
-    s->set_saturation(s, saturationValue);
-  }
-
   // AWB
   uint8_t awbValue = EEPROM.read(base + 5);
   if (awbValue == 0 || awbValue == 1) {
     s->set_whitebal(s, awbValue == 1);
-  }
-
-  // Special Effect
-  uint8_t effectValue = EEPROM.read(base + 6);
-  if (effectValue <= 6) {
-    s->set_special_effect(s, effectValue);
   }
 
   // AE Level
