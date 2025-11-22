@@ -367,6 +367,7 @@ inline IrState readIrRaw()
 }
 
 void irDisableForCritical() {
+  ir_off();  // Physically turn off IR transmitter to prevent spurious signals
   detachInterrupt(digitalPinToInterrupt(IR_PIN));
   g_irSensingEnabled = false;
 }
@@ -380,6 +381,8 @@ void irEnableAfterCritical() {
   g_lastStableMs = now;
   g_irSensingEnabled = true;
   attachInterrupt(digitalPinToInterrupt(IR_PIN), ir_falling_isr, FALLING);
+  delay(5);
+  ir_on();  // Turn IR transmitter back on
 }
 
 void checkResetReason() {
@@ -597,20 +600,25 @@ void captureAndSendImage() {
   }
   captureStartTime = millis();
   irDisableForCritical();
-  ir_off();  // Turn off IR during image capture
   delay(5); // Short delay to allow camera to adjust to lighting change. Increase if IR bleed shines through
-  camera_fb_t * fb = esp_camera_fb_get();
   
-  esp_camera_fb_return(fb);
+  // First capture to flush the old frame from the buffer
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (fb) {
+    esp_camera_fb_return(fb);
+  }
+  
+  // Second capture to get the current frame
   fb = esp_camera_fb_get();
-  ir_on(); // Turn IR back on after image capture
-  irEnableAfterCritical();
+  
   if (!fb) {
     Serial.println("Camera capture failed");
     mqttDebugPrintln("Camera capture failed");
-
+    irEnableAfterCritical();  // CRITICAL: Must re-enable IR even on failure
     return;
   }
+  
+  irEnableAfterCritical();  // Re-enable IR as soon as capture completes
 
   mqttDebugPrintf("Image size: %u bytes\n", fb->len);
 
@@ -1849,8 +1857,11 @@ void setupOTA() {
 
 void saveSettingsToEEPROM() {
   mqttDebugPrintln("Saving settings to EEPROM...");
-
-  irDisableForCritical();
+  
+  bool wasEnabled = g_irSensingEnabled;
+  if (wasEnabled) {
+    irDisableForCritical();
+  }
 
   // Save the version number
   EEPROM.write(EEPROM_ADDRESS_VERSION, EEPROM_VERSION);
@@ -1883,8 +1894,11 @@ void saveSettingsToEEPROM() {
   }
 
   EEPROM.commit();
-
-  irEnableAfterCritical();
+  
+  // Only re-enable if we were the ones who disabled it
+  if (wasEnabled) {
+    irEnableAfterCritical();
+  }
 }
 
 
@@ -2074,7 +2088,10 @@ void savePresetToEEPROM(uint8_t presetIndex) {
     return;
   }
 
-  irDisableForCritical();
+  bool wasEnabled = g_irSensingEnabled;
+  if (wasEnabled) {
+    irDisableForCritical();
+  }
 
   EEPROM.write(base + 0, s->status.framesize);
   EEPROM.write(base + 1, s->status.quality);
@@ -2093,7 +2110,9 @@ void savePresetToEEPROM(uint8_t presetIndex) {
 
   EEPROM.commit();
 
-  irEnableAfterCritical();
+  if (wasEnabled) {
+    irEnableAfterCritical();
+  }
 }
 
 // Helper: apply a preset from EEPROM to the sensor
@@ -2204,10 +2223,12 @@ void handleCameraPresetSelect(String presetStr) {
   }
 
   activeCameraPreset = newPreset;
+  
+  // Disable IR for EEPROM write and entire preset application
   irDisableForCritical();
+  
   EEPROM.write(EEPROM_ADDRESS_ACTIVE_PRESET, activeCameraPreset);
   EEPROM.commit();
-  irEnableAfterCritical();
 
   applyPresetFromEEPROM(activeCameraPreset);
 
@@ -2217,6 +2238,8 @@ void handleCameraPresetSelect(String presetStr) {
   mqttDebugPrintf("Camera preset %s applied", activeCameraPreset == 0 ? "day" : "night");
 
   lastSettingsChangeTime = millis();
+  
+  irEnableAfterCritical();
 }
 
 void handleCameraPresetSave() {
