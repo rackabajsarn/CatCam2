@@ -68,6 +68,8 @@ const char* password = WIFI_PASSWORD;
 #define SET_AWB_TOPIC "catflap/awb/set"
 #define MODEL_SOURCE_TOPIC "catflap/model_source"
 #define SET_MODEL_SOURCE_TOPIC "catflap/model_source/set"
+#define INFERENCE_MODE_TOPIC "catflap/inference_mode"
+#define SET_INFERENCE_MODE_TOPIC "catflap/inference_mode/set"
 #define ESP32_INFERENCE_TOPIC "catflap/esp32_inference"
 #define SERVER_INFERENCE_TOPIC "catflap/server_inference"
 #define INFERENCE_COMPARISON_TOPIC "catflap/inference_comparison"
@@ -76,19 +78,42 @@ const char* password = WIFI_PASSWORD;
 #define DEVICE_NAME "catflap"
 #define DEVICE_UNIQUE_ID "catflap_esp32"
 #define MQTT_DISCOVERY_PREFIX "homeassistant"
-#define DEVICE_SW_VERSION "1.0.2" //Increment together with git commits
+#define DEVICE_SW_VERSION "1.0.3" //Increment together with git commits
 
 // EEPROM Addresses
 #define EEPROM_SIZE 160
-#define EEPROM_VERSION 6  // Increment this number whenever you change the EEPROM layout
-#define EEPROM_ADDRESS_VERSION 0
-#define EEPROM_ADDRESS_DETECTION_MODE 1
-#define EEPROM_ADDR_COOLDOWN 2
-#define EEPROM_ADDRESS_CAT_LOCATION 3
-#define EEPROM_ADDRESS_CAMERA_SETTINGS 4   // Live camera settings (14 bytes currently)
-#define EEPROM_ADDRESS_PRESET_DAY   20     // Day preset camera settings
-#define EEPROM_ADDRESS_PRESET_NIGHT 36     // Night preset camera settings
-#define EEPROM_ADDRESS_ACTIVE_PRESET 52    // 0=day, 1=night
+#define EEPROM_VERSION 7  // Increment this number whenever you change the EEPROM layout
+
+// Base Addresses
+#define EEPROM_ADDR_VERSION         0
+#define EEPROM_ADDR_DETECTION_MODE  1
+#define EEPROM_ADDR_COOLDOWN        2
+#define EEPROM_ADDR_CAT_LOCATION    3
+#define EEPROM_ADDR_INFERENCE_MODE  4
+#define EEPROM_ADDR_ACTIVE_PRESET   5
+
+// Camera Settings Blocks (Base Addresses)
+#define EEPROM_BASE_LIVE_SETTINGS   10
+#define EEPROM_BASE_PRESET_DAY      30
+#define EEPROM_BASE_PRESET_NIGHT    50
+
+// Camera Settings Offsets (relative to Base)
+#define CAM_OFFSET_QUALITY          0
+#define CAM_OFFSET_BRIGHTNESS       1
+#define CAM_OFFSET_CONTRAST         2
+#define CAM_OFFSET_AWB              3
+#define CAM_OFFSET_AE_LEVEL         4
+#define CAM_OFFSET_AEC_VALUE_L      5
+#define CAM_OFFSET_AEC_VALUE_H      6
+#define CAM_OFFSET_AEC              7
+#define CAM_OFFSET_AEC2             8
+#define CAM_OFFSET_AGC              9
+#define CAM_OFFSET_AGC_GAIN         10
+
+// Inference Modes
+#define INFERENCE_MODE_LOCAL  0
+#define INFERENCE_MODE_SERVER 1
+#define INFERENCE_MODE_BOTH   2
 
 // GPIO Definitions
 #define IR_PIN 32
@@ -198,6 +223,7 @@ void initializeEEPROM();
 void savePresetToEEPROM(uint8_t presetIndex);
 void applyPresetFromEEPROM(uint8_t presetIndex);
 void handleModelSourceCommand(String stateStr);
+void handleInferenceModeCommand(String modeStr);
 
 // Add more handler functions as needed
 
@@ -214,6 +240,7 @@ bool barrierTriggered = false;  // Flag to indicate barrier has been triggered
 bool barrierStableState = false; // Last confirmed stable state (false = not broken, true = broken)
 esp_err_t cameraInitStatus = ESP_FAIL;
 bool useLocalModel = true;  // Default to local model.cc when no SD card
+uint8_t inferenceMode = INFERENCE_MODE_BOTH; // Default to both
 
 // Model comparison tracking
 String lastESP32Inference = "";
@@ -540,7 +567,7 @@ void checkResetReason() {
 }
 
 bool isEEPROMInitialized() {
-  uint8_t version = EEPROM.read(EEPROM_ADDRESS_VERSION);
+  uint8_t version = EEPROM.read(EEPROM_ADDR_VERSION);
   return version == EEPROM_VERSION;
 }
 
@@ -549,12 +576,13 @@ void initializeEEPROM() {
   
   // Write the current version to EEPROM
   // This write is buffered and will be committed by saveSettingsToEEPROM()
-  EEPROM.write(EEPROM_ADDRESS_VERSION, EEPROM_VERSION);
+  EEPROM.write(EEPROM_ADDR_VERSION, EEPROM_VERSION);
   
   // Initialize settings to default values
   detectionModeEnabled = true;
   cooldownDuration = 0.0;
   catLocation = true; // default: cat is home
+  inferenceMode = INFERENCE_MODE_BOTH; // Default to both
   
   // Initialize camera settings to defaults
   sensor_t * s = esp_camera_sensor_get();
@@ -598,7 +626,7 @@ void initializeEEPROM() {
   // Default active preset: day
   irDisableForCritical();
   activeCameraPreset = 0;
-  EEPROM.write(EEPROM_ADDRESS_ACTIVE_PRESET, activeCameraPreset);
+  EEPROM.write(EEPROM_ADDR_ACTIVE_PRESET, activeCameraPreset);
   EEPROM.commit();
   irEnableAfterCritical();
 }
@@ -691,6 +719,7 @@ void mqttSubscribe() {
     client.subscribe(SET_AGC_GAIN_TOPIC);
     client.subscribe(SET_CAMERA_PRESET_TOPIC);
     client.subscribe(SET_CAMERA_PRESET_SAVE_TOPIC);
+    client.subscribe(SET_INFERENCE_MODE_TOPIC);
 }
 
 void mqttInitialPublish() {
@@ -701,6 +730,14 @@ void mqttInitialPublish() {
   client.publish(DEBUG_TOGGLE_TOPIC, mqttDebugEnabled ? "ON" : "OFF", true);
   client.publish(CAT_LOCATION_TOPIC, catLocation ? "ON" : "OFF", true);
   client.publish(CAMERA_PRESET_TOPIC, activeCameraPreset == 0 ? "day" : "night", true);
+  
+  String modeStr;
+  switch(inferenceMode) {
+    case INFERENCE_MODE_LOCAL: modeStr = "local"; break;
+    case INFERENCE_MODE_SERVER: modeStr = "server"; break;
+    default: modeStr = "both"; break;
+  }
+  client.publish(INFERENCE_MODE_TOPIC, modeStr.c_str(), true);
 }
 
 esp_err_t initCamera() {
@@ -934,55 +971,66 @@ void captureAndSendImage() {
       return;
   }
   captureEndTime = millis();
-  // Resize the cropped image to 96x96 for ESP32 inference.
-  camera_fb_t *resized = resizeFrame(cropped);
-  if (!resized) {
-      esp_camera_fb_return(fb);
-      return;
-  }
 
-  // Copy resized data to input buffer for inference
-  // The resized image should already be grayscale 96x96
-  memcpy((void*)resized->buf, (const void*)resized->buf, 96 * 96);
-  
-  // Run LOCAL ESP32 inference on 96x96 image for prey/not_prey
-  bool esp32PreyDetected = run_inference(resized->buf, 96 * 96);
-  
-  // Publish ESP32 inference result
-  String esp32Result = esp32PreyDetected ? "prey" : "not_prey";
-  lastESP32Inference = esp32Result;
-  client.publish(ESP32_INFERENCE_TOPIC, esp32Result.c_str(), false);
-  
-  // Make flap decision based on LOCAL inference
-  if (esp32PreyDetected) {
-    handleFlapStateCommand("OFF");
-    mqttDebugPrintln("ESP32: Prey detected - closing flap");
-  } else {
-    handleFlapStateCommand("ON");
-    mqttDebugPrintln("ESP32: No prey - opening flap");
-  }
-  
-  // Free the resized frame's buffer and struct.
-  if (resized->buf) heap_caps_free(resized->buf);
-  heap_caps_free(resized);
-
-  // Convert cropped 384x384 to JPEG for sending to server
-  processCroppedAndConvert(cropped);
-
-  captureEndTime = millis();
-
-  // Publish the 384x384 image to server via MQTT for detailed inference
-  if (client.connected()) {
-    if (client.publish(IMAGE_TOPIC, cropped->buf, cropped->len, true)) {
-      mqttDebugPrintln("Image sent to server for inference");
+  // --- LOCAL INFERENCE PATH ---
+  if (inferenceMode == INFERENCE_MODE_LOCAL || inferenceMode == INFERENCE_MODE_BOTH) {
+    // Resize the cropped image to 96x96 for ESP32 inference.
+    camera_fb_t *resized = resizeFrame(cropped);
+    if (resized) {
+      // Copy resized data to input buffer for inference
+      // The resized image should already be grayscale 96x96
+      memcpy((void*)resized->buf, (const void*)resized->buf, 96 * 96);
+      
+      // Run LOCAL ESP32 inference on 96x96 image for prey/not_prey
+      bool esp32PreyDetected = run_inference(resized->buf, 96 * 96);
+      
+      // Publish ESP32 inference result
+      String esp32Result = esp32PreyDetected ? "prey" : "not_prey";
+      lastESP32Inference = esp32Result;
+      client.publish(ESP32_INFERENCE_TOPIC, esp32Result.c_str(), false);
+      
+      // Make flap decision based on LOCAL inference
+      if (esp32PreyDetected) {
+        handleFlapStateCommand("OFF");
+        mqttDebugPrintln("ESP32: Prey detected - closing flap");
+      } else {
+        handleFlapStateCommand("ON");
+        mqttDebugPrintln("ESP32: No prey - opening flap");
+      }
+      
+      // Free the resized frame's buffer and struct.
+      if (resized->buf) heap_caps_free(resized->buf);
+      heap_caps_free(resized);
     } else {
-      mqttDebugPrintln("Failed to send image to server");
+      mqttDebugPrintln("Failed to resize for local inference");
     }
   }
-  sendEndTime = millis();
 
-  // Free the cropped frame (now JPEG)
-  if (cropped->buf) free(cropped->buf); // frame2jpg uses standard malloc
+  // --- SERVER INFERENCE PATH ---
+  if (inferenceMode == INFERENCE_MODE_SERVER || inferenceMode == INFERENCE_MODE_BOTH) {
+    // Convert cropped 384x384 to JPEG for sending to server
+    processCroppedAndConvert(cropped);
+
+    // Publish the 384x384 image to server via MQTT for detailed inference
+    if (client.connected()) {
+      if (client.publish(IMAGE_TOPIC, cropped->buf, cropped->len, true)) {
+        mqttDebugPrintln("Image sent to server for inference");
+      } else {
+        mqttDebugPrintln("Failed to send image to server");
+      }
+    }
+    sendEndTime = millis();
+  }
+
+  // Free the cropped frame (it might be JPEG now if server path ran, or still grayscale if not)
+  // processCroppedAndConvert uses standard malloc for the new buffer if it converts
+  // cropFrame uses PSRAM malloc
+  
+  if (cropped->format == PIXFORMAT_JPEG) {
+     if (cropped->buf) free(cropped->buf); // frame2jpg uses standard malloc
+  } else {
+     if (cropped->buf) heap_caps_free(cropped->buf); // still in PSRAM
+  }
   heap_caps_free(cropped); // struct was in PSRAM
 
   esp_camera_fb_return(fb);
@@ -1136,6 +1184,8 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
     handleCatLocationCommand(incomingMessage);
   } else if (String(topic) == SET_MODEL_SOURCE_TOPIC) {
     handleModelSourceCommand(incomingMessage);
+  } else if (String(topic) == SET_INFERENCE_MODE_TOPIC) {
+    handleInferenceModeCommand(incomingMessage);
   } else {
     mqttDebugPrintln("unknown topic");
   }
@@ -1669,6 +1719,24 @@ void publishDiscoveryConfigs() {
   String modelSourceConfigPayload;
   serializeJson(modelSourceConfig, modelSourceConfigPayload);
   client.publish(modelSourceConfigTopic.c_str(), modelSourceConfigPayload.c_str(), true);
+
+  // Inference Mode Select
+  String inferenceModeConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/select/" + DEVICE_NAME + "/inference_mode/config";
+  DynamicJsonDocument inferenceModeConfig(capacity);
+  inferenceModeConfig["name"] = "Inference Mode";
+  inferenceModeConfig["command_topic"] = SET_INFERENCE_MODE_TOPIC;
+  inferenceModeConfig["state_topic"] = INFERENCE_MODE_TOPIC;
+  inferenceModeConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_inference_mode";
+  inferenceModeConfig["icon"] = "mdi:brain";
+  JsonArray modeOptions = inferenceModeConfig.createNestedArray("options");
+  modeOptions.add("local");
+  modeOptions.add("server");
+  modeOptions.add("both");
+  JsonObject deviceInfoInferenceMode = inferenceModeConfig.createNestedObject("device");
+  deviceInfoInferenceMode["identifiers"] = DEVICE_UNIQUE_ID;
+  String inferenceModeConfigPayload;
+  serializeJson(inferenceModeConfig, inferenceModeConfigPayload);
+  client.publish(inferenceModeConfigTopic.c_str(), inferenceModeConfigPayload.c_str(), true);
 }
 
 // TODO: Inference handled on device. compare inference from device and from mqtt
@@ -2228,33 +2296,33 @@ void saveSettingsToEEPROM() {
   irDisableForCritical();
 
   // Save the version number
-  EEPROM.write(EEPROM_ADDRESS_VERSION, EEPROM_VERSION);
+  EEPROM.write(EEPROM_ADDR_VERSION, EEPROM_VERSION);
 
-  EEPROM.write(EEPROM_ADDRESS_DETECTION_MODE, detectionModeEnabled ? 1 : 0);
+  EEPROM.write(EEPROM_ADDR_DETECTION_MODE, detectionModeEnabled ? 1 : 0);
 
   // Save Cooldown Duration
   EEPROM.write(EEPROM_ADDR_COOLDOWN, (int)(cooldownDuration * 10));
 
   // Save cat location (1 = home/ON, 0 = away/OFF)
-  EEPROM.write(EEPROM_ADDRESS_CAT_LOCATION, catLocation ? 1 : 0);
+  EEPROM.write(EEPROM_ADDR_CAT_LOCATION, catLocation ? 1 : 0);
+
+  // Save Inference Mode
+  EEPROM.write(EEPROM_ADDR_INFERENCE_MODE, inferenceMode);
 
   // Save camera settings
   sensor_t * s = esp_camera_sensor_get();
   if (s != NULL) {
-    //EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 0, s->status.framesize); // Removed
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 1, s->status.quality);
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 2, s->status.brightness);
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 3, s->status.contrast);
-    //EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 4, s->status.saturation); // Removed
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 5, s->status.awb ? 1 : 0);
-    //EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 6, s->status.special_effect); // Removed
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 7, (int8_t)s->status.ae_level);
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 8, (uint8_t)(s->status.aec_value & 0xFF));
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 9, (uint8_t)((s->status.aec_value >> 8) & 0xFF));
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 10, s->status.aec ? 1 : 0);
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 11, s->status.aec2 ? 1 : 0);
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 12, s->status.agc ? 1 : 0);
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 13, s->status.agc_gain);
+    EEPROM.write(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_QUALITY, s->status.quality);
+    EEPROM.write(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_BRIGHTNESS, s->status.brightness);
+    EEPROM.write(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_CONTRAST, s->status.contrast);
+    EEPROM.write(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_AWB, s->status.awb ? 1 : 0);
+    EEPROM.write(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_AE_LEVEL, (int8_t)s->status.ae_level);
+    EEPROM.write(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_AEC_VALUE_L, (uint8_t)(s->status.aec_value & 0xFF));
+    EEPROM.write(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_AEC_VALUE_H, (uint8_t)((s->status.aec_value >> 8) & 0xFF));
+    EEPROM.write(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_AEC, s->status.aec ? 1 : 0);
+    EEPROM.write(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_AEC2, s->status.aec2 ? 1 : 0);
+    EEPROM.write(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_AGC, s->status.agc ? 1 : 0);
+    EEPROM.write(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_AGC_GAIN, s->status.agc_gain);
   }
 
   EEPROM.commit();
@@ -2265,7 +2333,7 @@ void loadSettingsFromEEPROM() {
     mqttDebugPrintln("Loading settings from EEPROM...");
 
     // Check EEPROM version
-    uint8_t storedVersion = EEPROM.read(EEPROM_ADDRESS_VERSION);
+    uint8_t storedVersion = EEPROM.read(EEPROM_ADDR_VERSION);
     if (storedVersion != EEPROM_VERSION) {
         mqttDebugPrintf("EEPROM version mismatch (found %d, expected %d). Initializing EEPROM...\n", 
                         storedVersion, EEPROM_VERSION);
@@ -2274,7 +2342,7 @@ void loadSettingsFromEEPROM() {
     }
 
     // Read and validate the Detection Mode setting
-    uint8_t detectionModeValue = EEPROM.read(EEPROM_ADDRESS_DETECTION_MODE);
+    uint8_t detectionModeValue = EEPROM.read(EEPROM_ADDR_DETECTION_MODE);
     if (detectionModeValue == 0 || detectionModeValue == 1) {
         detectionModeEnabled = detectionModeValue == 1;
     } else {
@@ -2292,7 +2360,7 @@ void loadSettingsFromEEPROM() {
   }
 
   // Read and validate Cat Location
-  uint8_t catLocationValue = EEPROM.read(EEPROM_ADDRESS_CAT_LOCATION);
+  uint8_t catLocationValue = EEPROM.read(EEPROM_ADDR_CAT_LOCATION);
   if (catLocationValue == 0 || catLocationValue == 1) {
     catLocation = (catLocationValue == 1);
   } else {
@@ -2300,8 +2368,16 @@ void loadSettingsFromEEPROM() {
     catLocation = true;  // Default: home
   }
 
+  // Read Inference Mode
+  uint8_t infMode = EEPROM.read(EEPROM_ADDR_INFERENCE_MODE);
+  if (infMode <= 2) {
+    inferenceMode = infMode;
+  } else {
+    inferenceMode = INFERENCE_MODE_BOTH;
+  }
+
   // Active camera preset (0=day, 1=night)
-  uint8_t presetValue = EEPROM.read(EEPROM_ADDRESS_ACTIVE_PRESET);
+  uint8_t presetValue = EEPROM.read(EEPROM_ADDR_ACTIVE_PRESET);
   if (presetValue <= 1) {
     activeCameraPreset = presetValue;
   } else {
@@ -2312,7 +2388,7 @@ void loadSettingsFromEEPROM() {
     sensor_t * s = esp_camera_sensor_get();
     if (s != NULL) {
         // JPEG Quality
-        uint8_t qualityValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 1);
+        uint8_t qualityValue = EEPROM.read(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_QUALITY);
         if (qualityValue >= 10 && qualityValue <= 63) {
             s->set_quality(s, qualityValue);
         } else {
@@ -2321,7 +2397,7 @@ void loadSettingsFromEEPROM() {
         }
 
         // Brightness
-        int8_t brightnessValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 2);
+        int8_t brightnessValue = (int8_t)EEPROM.read(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_BRIGHTNESS);
         if (brightnessValue >= -2 && brightnessValue <= 2) {
             s->set_brightness(s, brightnessValue);
         } else {
@@ -2330,7 +2406,7 @@ void loadSettingsFromEEPROM() {
         }
 
         // Contrast
-        int8_t contrastValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 3);
+        int8_t contrastValue = (int8_t)EEPROM.read(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_CONTRAST);
         if (contrastValue >= -2 && contrastValue <= 2) {
             s->set_contrast(s, contrastValue);
         } else {
@@ -2339,7 +2415,7 @@ void loadSettingsFromEEPROM() {
         }
 
         // Automatic White Balance (AWB)
-        uint8_t awbValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 5);
+        uint8_t awbValue = EEPROM.read(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_AWB);
         if (awbValue <= 1) {
             s->set_whitebal(s, awbValue == 1);
         } else {
@@ -2348,7 +2424,7 @@ void loadSettingsFromEEPROM() {
         }
 
     // AE Level
-    int8_t aeLevelValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 7);
+    int8_t aeLevelValue = (int8_t)EEPROM.read(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_AE_LEVEL);
     if (aeLevelValue >= -2 && aeLevelValue <= 2) {
       s->set_ae_level(s, aeLevelValue);
     } else {
@@ -2357,8 +2433,8 @@ void loadSettingsFromEEPROM() {
     }
 
     // AEC Value (two bytes, little-endian)
-    uint8_t aecLo = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 8);
-    uint8_t aecHi = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 9);
+    uint8_t aecLo = EEPROM.read(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_AEC_VALUE_L);
+    uint8_t aecHi = EEPROM.read(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_AEC_VALUE_H);
     uint16_t aecValue = (uint16_t)aecLo | ((uint16_t)aecHi << 8);
     if (aecValue <= 1200) {
       s->set_aec_value(s, aecValue);
@@ -2368,7 +2444,7 @@ void loadSettingsFromEEPROM() {
     }
 
     // Exposure Control (AEC enable)
-    uint8_t exposureCtrlValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 10);
+    uint8_t exposureCtrlValue = EEPROM.read(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_AEC);
     if (exposureCtrlValue == 0 || exposureCtrlValue == 1) {
       s->set_exposure_ctrl(s, exposureCtrlValue == 1);
     } else {
@@ -2377,7 +2453,7 @@ void loadSettingsFromEEPROM() {
     }
 
     // AEC2
-    uint8_t aec2Value = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 11);
+    uint8_t aec2Value = EEPROM.read(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_AEC2);
     if (aec2Value == 0 || aec2Value == 1) {
       s->set_aec2(s, aec2Value == 1);
     } else {
@@ -2386,7 +2462,7 @@ void loadSettingsFromEEPROM() {
     }
 
     // Gain Control (AGC enable)
-    uint8_t gainCtrlValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 12);
+    uint8_t gainCtrlValue = EEPROM.read(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_AGC);
     if (gainCtrlValue == 0 || gainCtrlValue == 1) {
       s->set_gain_ctrl(s, gainCtrlValue == 1);
     } else {
@@ -2395,7 +2471,7 @@ void loadSettingsFromEEPROM() {
     }
 
     // AGC Gain
-    uint8_t agcGainValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 13);
+    uint8_t agcGainValue = EEPROM.read(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_AGC_GAIN);
     if (agcGainValue <= 30) {
       s->set_agc_gain(s, agcGainValue);
     } else {
@@ -2414,7 +2490,7 @@ void loadSettingsFromEEPROM() {
 void savePresetToEEPROM(uint8_t presetIndex) {
   if (presetIndex > 1) return;
 
-  uint16_t base = (presetIndex == 0) ? EEPROM_ADDRESS_PRESET_DAY : EEPROM_ADDRESS_PRESET_NIGHT;
+  uint16_t base = (presetIndex == 0) ? EEPROM_BASE_PRESET_DAY : EEPROM_BASE_PRESET_NIGHT;
 
   sensor_t * s = esp_camera_sensor_get();
   if (s == NULL) {
@@ -2424,20 +2500,17 @@ void savePresetToEEPROM(uint8_t presetIndex) {
 
   irDisableForCritical();
 
-  //EEPROM.write(base + 0, s->status.framesize); // Removed
-  EEPROM.write(base + 1, s->status.quality);
-  EEPROM.write(base + 2, s->status.brightness);
-  EEPROM.write(base + 3, s->status.contrast);
-  //EEPROM.write(base + 4, s->status.saturation); // Removed
-  EEPROM.write(base + 5, s->status.awb ? 1 : 0);
-  //EEPROM.write(base + 6, s->status.special_effect); // Removed
-  EEPROM.write(base + 7, (int8_t)s->status.ae_level);
-  EEPROM.write(base + 8, (uint8_t)(s->status.aec_value & 0xFF));
-  EEPROM.write(base + 9, (uint8_t)((s->status.aec_value >> 8) & 0xFF));
-  EEPROM.write(base + 10, s->status.aec ? 1 : 0);
-  EEPROM.write(base + 11, s->status.aec2 ? 1 : 0);
-  EEPROM.write(base + 12, s->status.agc ? 1 : 0);
-  EEPROM.write(base + 13, s->status.agc_gain);
+  EEPROM.write(base + CAM_OFFSET_QUALITY, s->status.quality);
+  EEPROM.write(base + CAM_OFFSET_BRIGHTNESS, s->status.brightness);
+  EEPROM.write(base + CAM_OFFSET_CONTRAST, s->status.contrast);
+  EEPROM.write(base + CAM_OFFSET_AWB, s->status.awb ? 1 : 0);
+  EEPROM.write(base + CAM_OFFSET_AE_LEVEL, (int8_t)s->status.ae_level);
+  EEPROM.write(base + CAM_OFFSET_AEC_VALUE_L, (uint8_t)(s->status.aec_value & 0xFF));
+  EEPROM.write(base + CAM_OFFSET_AEC_VALUE_H, (uint8_t)((s->status.aec_value >> 8) & 0xFF));
+  EEPROM.write(base + CAM_OFFSET_AEC, s->status.aec ? 1 : 0);
+  EEPROM.write(base + CAM_OFFSET_AEC2, s->status.aec2 ? 1 : 0);
+  EEPROM.write(base + CAM_OFFSET_AGC, s->status.agc ? 1 : 0);
+  EEPROM.write(base + CAM_OFFSET_AGC_GAIN, s->status.agc_gain);
 
   EEPROM.commit();
 
@@ -2448,7 +2521,7 @@ void savePresetToEEPROM(uint8_t presetIndex) {
 void applyPresetFromEEPROM(uint8_t presetIndex) {
   if (presetIndex > 1) return;
 
-  uint16_t base = (presetIndex == 0) ? EEPROM_ADDRESS_PRESET_DAY : EEPROM_ADDRESS_PRESET_NIGHT;
+  uint16_t base = (presetIndex == 0) ? EEPROM_BASE_PRESET_DAY : EEPROM_BASE_PRESET_NIGHT;
 
   sensor_t * s = esp_camera_sensor_get();
   if (s == NULL) {
@@ -2456,70 +2529,64 @@ void applyPresetFromEEPROM(uint8_t presetIndex) {
     return;
   }
 
-  // Framesize
-  // uint8_t framesizeValue = EEPROM.read(base + 0);
-  // if (framesizeValue >= FRAMESIZE_QQVGA && framesizeValue <= FRAMESIZE_UXGA) {
-  //   s->set_framesize(s, (framesize_t)framesizeValue);
-  // }
-
   // JPEG Quality
-  uint8_t qualityValue = EEPROM.read(base + 1);
+  uint8_t qualityValue = EEPROM.read(base + CAM_OFFSET_QUALITY);
   if (qualityValue >= 10 && qualityValue <= 63) {
     s->set_quality(s, qualityValue);
   }
 
   // Brightness
-  int8_t brightnessValue = (int8_t)EEPROM.read(base + 2);
+  int8_t brightnessValue = (int8_t)EEPROM.read(base + CAM_OFFSET_BRIGHTNESS);
   if (brightnessValue >= -2 && brightnessValue <= 2) {
     s->set_brightness(s, brightnessValue);
   }
 
   // Contrast
-  int8_t contrastValue = (int8_t)EEPROM.read(base + 3);
+  int8_t contrastValue = (int8_t)EEPROM.read(base + CAM_OFFSET_CONTRAST);
   if (contrastValue >= -2 && contrastValue <= 2) {
     s->set_contrast(s, contrastValue);
   }
 
   // AWB
-  uint8_t awbValue = EEPROM.read(base + 5);
+  uint8_t awbValue = EEPROM.read(base + CAM_OFFSET_AWB);
   if (awbValue == 0 || awbValue == 1) {
     s->set_whitebal(s, awbValue == 1);
   }
 
   // AE Level
-  int8_t aeLevelValue = (int8_t)EEPROM.read(base + 7);
+  int8_t aeLevelValue = (int8_t)EEPROM.read(base + CAM_OFFSET_AE_LEVEL);
   if (aeLevelValue >= -2 && aeLevelValue <= 2) {
     s->set_ae_level(s, aeLevelValue);
   }
 
   // AEC Value
-  uint8_t aecLo = EEPROM.read(base + 8);
-  uint8_t aecHi = EEPROM.read(base + 9);
+  uint8_t aecLo = EEPROM.read(base + CAM_OFFSET_AEC_VALUE_L);
+  uint8_t aecHi = EEPROM.read(base + CAM_OFFSET_AEC_VALUE_H);
   uint16_t aecValue = (uint16_t)aecLo | ((uint16_t)aecHi << 8);
   if (aecValue <= 1200) {
     s->set_aec_value(s, aecValue);
   }
 
   // Exposure Control
-  uint8_t exposureCtrlValue = EEPROM.read(base + 10);
+  uint8_t exposureCtrlValue = EEPROM.read(base + CAM_OFFSET_AEC);
   if (exposureCtrlValue == 0 || exposureCtrlValue == 1) {
     s->set_exposure_ctrl(s, exposureCtrlValue == 1);
   }
 
   // AEC2
-  uint8_t aec2Value = EEPROM.read(base + 11);
+  uint8_t aec2Value = EEPROM.read(base + CAM_OFFSET_AEC2);
   if (aec2Value == 0 || aec2Value == 1) {
     s->set_aec2(s, aec2Value == 1);
   }
 
   // Gain Control
-  uint8_t gainCtrlValue = EEPROM.read(base + 12);
+  uint8_t gainCtrlValue = EEPROM.read(base + CAM_OFFSET_AGC);
   if (gainCtrlValue == 0 || gainCtrlValue == 1) {
     s->set_gain_ctrl(s, gainCtrlValue == 1);
   }
 
   // AGC Gain
-  uint8_t agcGainValue = EEPROM.read(base + 13);
+  uint8_t agcGainValue = EEPROM.read(base + CAM_OFFSET_AGC_GAIN);
   if (agcGainValue <= 30) {
     s->set_agc_gain(s, agcGainValue);
   }
@@ -2541,7 +2608,7 @@ void handleCameraPresetSelect(String presetStr) {
 
   activeCameraPreset = newPreset;
   irDisableForCritical();
-  EEPROM.write(EEPROM_ADDRESS_ACTIVE_PRESET, activeCameraPreset);
+  EEPROM.write(EEPROM_ADDR_ACTIVE_PRESET, activeCameraPreset);
   EEPROM.commit();
   irEnableAfterCritical();
 
@@ -2590,4 +2657,28 @@ void handleModelSourceCommand(String stateStr) {
     if (!setupInference()) {
         mqttDebugPrintln("Failed to reinitialize inference after model switch");
     }
+}
+
+void handleInferenceModeCommand(String modeStr) {
+  uint8_t newMode;
+  if (modeStr.equalsIgnoreCase("local")) {
+    newMode = INFERENCE_MODE_LOCAL;
+  } else if (modeStr.equalsIgnoreCase("server")) {
+    newMode = INFERENCE_MODE_SERVER;
+  } else if (modeStr.equalsIgnoreCase("both")) {
+    newMode = INFERENCE_MODE_BOTH;
+  } else {
+    mqttDebugPrintln("Invalid inference mode");
+    return;
+  }
+
+  inferenceMode = newMode;
+  
+  // Save to EEPROM
+  EEPROM.write(EEPROM_ADDR_INFERENCE_MODE, inferenceMode);
+  EEPROM.commit();
+
+  // Publish state
+  client.publish(INFERENCE_MODE_TOPIC, modeStr.c_str(), true);
+  mqttDebugPrintf("Inference mode set to: %s\n", modeStr.c_str());
 }
