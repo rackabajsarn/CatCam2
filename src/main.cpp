@@ -183,7 +183,6 @@ void handleBrightnessCommand(String brightnessStr);
 void handleContrastCommand(String contrastStr);
 void handleSaturationCommand(String saturationStr);
 void handleAWBCommand(String awbStateStr);
-void handleExposureCtrlCommand(String stateStr);
 void handleAECValueCommand(String aecStr);
 void handleCooldownCommand(String cooldownStr);
 void handleAeLevelCommand(String levelStr);
@@ -1153,10 +1152,6 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
     handleServerInference(incomingMessage);
   } else if (String(topic) == SET_CAT_LOCATION_TOPIC) {
     handleCatLocationCommand(incomingMessage);
-  } else if (String(topic) == SET_EXPOSURE_CTRL_TOPIC) {
-    handleExposureCtrlCommand(incomingMessage);
-  } else if (String(topic) == SET_AEC_VALUE_TOPIC) {
-    handleAECValueCommand(incomingMessage);
   } else if (String(topic) == SET_MODEL_SOURCE_TOPIC) {
     handleModelSourceCommand(incomingMessage);
   } else {
@@ -1695,37 +1690,6 @@ void publishDiscoveryConfigs() {
   serializeJson(looptimeSensorConfig, looptimeSensorConfigPayload);
   client.publish(looptimeSensorConfigTopic.c_str(), looptimeSensorConfigPayload.c_str(), true);
 
-  // Exposure Control Switch
-  String exposureControlConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/exposure_ctrl/config";
-  DynamicJsonDocument exposureControlConfig(512);
-  exposureControlConfig["name"] = "Exposure Control";
-  exposureControlConfig["command_topic"] = SET_EXPOSURE_CTRL_TOPIC;
-  exposureControlConfig["state_topic"] = EXPOSURE_CTRL_TOPIC;
-  exposureControlConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_exposure_ctrl";
-  exposureControlConfig["payload_on"] = "ON";
-  exposureControlConfig["payload_off"] = "OFF";
-  JsonObject deviceInfoExposureCtrl = exposureControlConfig.createNestedObject("device");
-  deviceInfoExposureCtrl["identifiers"] = DEVICE_UNIQUE_ID;
-  String exposureControlConfigPayload;
-  serializeJson(exposureControlConfig, exposureControlConfigPayload);
-  client.publish(exposureControlConfigTopic.c_str(), exposureControlConfigPayload.c_str(), true);
-
-  // AEC Value Number
-  String aecValueConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/number/" + DEVICE_NAME + "/aec_value/config";
-  DynamicJsonDocument aecValueConfig(512);
-  aecValueConfig["name"] = "AEC Value";
-  aecValueConfig["command_topic"] = SET_AEC_VALUE_TOPIC;
-  aecValueConfig["state_topic"] = AEC_VALUE_TOPIC;
-  aecValueConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_aec_value";
-  aecValueConfig["min"] = 0;
-  aecValueConfig["max"] = 1200;
-  aecValueConfig["step"] = 10;
-  JsonObject deviceInfoAecValue = aecValueConfig.createNestedObject("device");
-  deviceInfoAecValue["identifiers"] = DEVICE_UNIQUE_ID;
-  String aecValueConfigPayload;
-  serializeJson(aecValueConfig, aecValueConfigPayload);
-  client.publish(aecValueConfigTopic.c_str(), aecValueConfigPayload.c_str(), true);
-
   // Model Source Switch
   String modelSourceConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/model_source/config";
   DynamicJsonDocument modelSourceConfig(512);
@@ -1891,37 +1855,6 @@ void handleAWBCommand(String awbStateStr) {
     lastSettingsChangeTime = millis();
   } else {
     mqttDebugPrintln("Failed to get camera sensor");
-  }
-}
-
-void handleExposureCtrlCommand(String stateStr) {
-  bool enabled = stateStr.equalsIgnoreCase("ON");
-  sensor_t *s = esp_camera_sensor_get();
-  if (s != NULL) {
-      s->set_exposure_ctrl(s, enabled);
-      mqttDebugPrintln("Exposure control updated");
-      client.publish(EXPOSURE_CTRL_TOPIC, enabled ? "ON" : "OFF", true);
-      lastSettingsChangeTime = millis();
-  } else {
-      mqttDebugPrintln("Failed to get camera sensor");
-  }
-}
-
-void handleAECValueCommand(String aecStr) {
-  int aec = aecStr.toInt();
-  if (aec < 0 || aec > 1200) {
-      mqttDebugPrintln("Invalid AEC value (0-1200)");
-      return;
-  }
-
-  sensor_t *s = esp_camera_sensor_get();
-  if (s != NULL) {
-      s->set_aec_value(s, aec);
-      mqttDebugPrintln("AEC value updated");
-      client.publish(AEC_VALUE_TOPIC, String(aec).c_str(), true);
-      lastSettingsChangeTime = millis();
-  } else {
-      mqttDebugPrintln("Failed to get camera sensor");
   }
 }
 
@@ -2365,7 +2298,7 @@ void saveSettingsToEEPROM() {
   // Save camera settings
   sensor_t * s = esp_camera_sensor_get();
   if (s != NULL) {
-    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 0, s->status.framesize);
+    EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 0, s->status.framesize); //TODO: remove
     EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 1, s->status.quality);
     EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 2, s->status.brightness);
     EEPROM.write(EEPROM_ADDRESS_CAMERA_SETTINGS + 3, s->status.contrast);
@@ -2436,7 +2369,7 @@ void loadSettingsFromEEPROM() {
     sensor_t * s = esp_camera_sensor_get();
     if (s != NULL) {
         // JPEG Quality
-        uint8_t qualityValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_QUALITY);
+        uint8_t qualityValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 1);
         if (qualityValue >= 10 && qualityValue <= 63) {
             s->set_quality(s, qualityValue);
         } else {
@@ -2445,7 +2378,7 @@ void loadSettingsFromEEPROM() {
         }
 
         // Brightness
-        int8_t brightnessValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_BRIGHTNESS);
+        int8_t brightnessValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 2);
         if (brightnessValue >= -2 && brightnessValue <= 2) {
             s->set_brightness(s, brightnessValue);
         } else {
@@ -2454,7 +2387,7 @@ void loadSettingsFromEEPROM() {
         }
 
         // Contrast
-        int8_t contrastValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_CONTRAST);
+        int8_t contrastValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 3);
         if (contrastValue >= -2 && contrastValue <= 2) {
             s->set_contrast(s, contrastValue);
         } else {
@@ -2463,7 +2396,7 @@ void loadSettingsFromEEPROM() {
         }
 
         // Saturation
-        int8_t saturationValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_SATURATION);
+        int8_t saturationValue = (int8_t)EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 4);
         if (saturationValue >= -2 && saturationValue <= 2) {
             s->set_saturation(s, saturationValue);
         } else {
@@ -2472,7 +2405,7 @@ void loadSettingsFromEEPROM() {
         }
 
         // Automatic White Balance (AWB)
-        uint8_t awbValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_AWB);
+        uint8_t awbValue = EEPROM.read(EEPROM_ADDRESS_CAMERA_SETTINGS + 5);
         if (awbValue <= 1) {
             s->set_whitebal(s, awbValue == 1);
         } else {
@@ -2552,6 +2485,7 @@ void loadSettingsFromEEPROM() {
 }
 
 // Helper: save current sensor settings into a preset slot
+// TODO: correct the adressing
 void savePresetToEEPROM(uint8_t presetIndex) {
   if (presetIndex > 1) return;
 
