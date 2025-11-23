@@ -20,6 +20,7 @@ const char* password = WIFI_PASSWORD;
 #define ALERT_TOPIC "catflap/alert"
 #define WIFI_SIGNAL_TOPIC "catflap/wifi_signal"
 #define FREE_HEAP_TOPIC "catflap/free_heap"
+#define IR_PULSE_QUALITY_TOPIC "catflap/ir_pulse_quality"
 #define ROUNDTRIP_TOPIC "catflap/roundtrip"
 #define LOOPTIME_TOPIC "catflap/looptime"
 #define IP_TOPIC "catflap/ip"
@@ -72,6 +73,7 @@ const char* password = WIFI_PASSWORD;
 #define IR_PWM_CH  2
 #define IR_FREQ    38000
 #define IR_DUTY    128
+#define BURST_INTERVAL       600       // µs: period of on/off for IR bursts
 #define IR_DEBOUNCE_MS       10        // time input must stay stable
 #define IR_MIN_HOLD_MS       120       // rate-limit chatter (optional)
 #define PULSE_CHECK_INTERVAL 20        // 50 ms between pulse count checks
@@ -206,6 +208,8 @@ static uint32_t g_lastStableMs = 0;      // last time we committed a stable chan
 static bool g_irSensingEnabled = true;   // mask while IR is intentionally off
 static volatile uint32_t g_pulseCount = 0;    // count IR pulses for robust detection
 static uint32_t g_lastPulseCheckMs = 0;       // last time we checked pulse count
+static uint32_t g_pulseQualitySum = 0;
+static uint32_t g_pulseQualitySamples = 0;
 
 
 void setup() {
@@ -336,7 +340,7 @@ void ir_off() { ledcWrite(IR_PWM_CH, 0); }
 void ir_burst() {
     // Call from loop() or a 1 kHz timer
     static uint32_t t=0; static bool on=false;
-    if (micros() - t > 600) {  // ~600 µs
+    if (micros() - t > BURST_INTERVAL) {  // ~600 µs
       t = micros();
       on = !on;
       on ? ir_on() : ir_off();
@@ -350,11 +354,19 @@ inline IrState readIrRaw()
   static IrState lastReading = IR_CLEAR;
   uint32_t nowMs = millis();
   
-  // Every 50ms, check if we got enough pulses
+  // Every 20ms, check if we got enough pulses
   if (nowMs - g_lastPulseCheckMs >= PULSE_CHECK_INTERVAL) {
     uint32_t pulses = g_pulseCount;
     g_pulseCount = 0;  // Reset counter
     g_lastPulseCheckMs = nowMs;
+    const uint32_t expectedPulses = (PULSE_CHECK_INTERVAL * 1000UL) / (BURST_INTERVAL * 2UL);  // ms -> µs, two edges per burst
+    const uint32_t clampExpected = expectedPulses > 0 ? expectedPulses : 1;
+    uint32_t pulsePercent = (pulses * 100U) / clampExpected;
+    if (pulsePercent > 100U) {
+      pulsePercent = 100U;
+    }
+    g_pulseQualitySum += pulsePercent;
+    g_pulseQualitySamples++;
     
     // We burst at ~830 Hz (600µs on + 600µs off = 1200µs period)
     // In 50ms we should see ~41 pulses if beam is clear
@@ -1230,6 +1242,22 @@ void publishDiscoveryConfigs() {
   serializeJson(wifiSignalSensorConfig, wifiSignalSensorConfigPayload);
   client.publish(wifiSignalSensorConfigTopic.c_str(), wifiSignalSensorConfigPayload.c_str(), true);
 
+  // IR Pulse Quality Sensor
+  String pulseQualityConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/ir_pulse_quality/config";
+  DynamicJsonDocument pulseQualityConfig(512);
+  pulseQualityConfig["name"] = "IR Pulse Quality";
+  pulseQualityConfig["state_topic"] = IR_PULSE_QUALITY_TOPIC;
+  pulseQualityConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_ir_pulse_quality";
+  pulseQualityConfig["unit_of_measurement"] = "%";
+  pulseQualityConfig["entity_category"] = "diagnostic";
+  pulseQualityConfig["icon"] = "mdi:percent";
+  pulseQualityConfig["state_class"] = "measurement";
+  JsonObject deviceInfoPulseQuality = pulseQualityConfig.createNestedObject("device");
+  deviceInfoPulseQuality["identifiers"] = DEVICE_UNIQUE_ID;
+  String pulseQualityConfigPayload;
+  serializeJson(pulseQualityConfig, pulseQualityConfigPayload);
+  client.publish(pulseQualityConfigTopic.c_str(), pulseQualityConfigPayload.c_str(), true);
+
   // IP Sensor
   String ipSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/ip/config";
   DynamicJsonDocument ipSensorConfig(512);
@@ -1716,6 +1744,14 @@ void publishDiagnostics() {
     client.publish(FREE_HEAP_TOPIC, freeHeap.c_str(), true);
     String loopTime = String(getAndResetMeanLoopTime());
     client.publish(LOOPTIME_TOPIC, loopTime.c_str(), true);
+    uint32_t avgPulseQuality = 0;
+    if (g_pulseQualitySamples > 0) {
+      avgPulseQuality = g_pulseQualitySum / g_pulseQualitySamples;
+    }
+    String pulseQualityStr = String(avgPulseQuality);
+    client.publish(IR_PULSE_QUALITY_TOPIC, pulseQualityStr.c_str(), true);
+    g_pulseQualitySum = 0;
+    g_pulseQualitySamples = 0;
   }
 }
 
