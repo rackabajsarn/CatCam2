@@ -79,7 +79,7 @@ const char* password = WIFI_PASSWORD;
 #define DEVICE_NAME "catflap"
 #define DEVICE_UNIQUE_ID "catflap_esp32"
 #define MQTT_DISCOVERY_PREFIX "homeassistant"
-#define DEVICE_SW_VERSION "1.0.3" //Increment together with git commits
+#define DEVICE_SW_VERSION "1.1.0" //Increment together with git commits
 
 // EEPROM Addresses
 #define EEPROM_SIZE 160
@@ -1019,6 +1019,10 @@ void captureAndSendImage() {
         mqttDebugPrintln("ESP32: No prey - opening flap");
       }
       
+      // Save 96x96 inference image to SD card
+      String filename = generateInferenceFilename(esp32Result);
+      saveGrayscaleToSD(resized->buf, 96, 96, filename.c_str());
+      
       // Free the resized frame's buffer and struct.
       if (resized->buf) heap_caps_free(resized->buf);
       heap_caps_free(resized);
@@ -1131,6 +1135,46 @@ camera_fb_t* resizeFrame(camera_fb_t *cropped) {
       }
   }
   return resized;
+}
+
+// Function to save a grayscale image to SD card as raw or PGM format
+// filename should include extension (e.g., "/inference/img_001.pgm")
+bool saveGrayscaleToSD(uint8_t* buf, int width, int height, const char* filename) {
+  if (!SD.exists("/inference")) {
+    SD.mkdir("/inference");
+  }
+  
+  File file = SD.open(filename, FILE_WRITE);
+  if (!file) {
+    mqttDebugPrintln("Failed to open file for writing");
+    return false;
+  }
+  
+  // Write PGM header (Portable GrayMap format - widely supported)
+  file.printf("P5\n%d %d\n255\n", width, height);
+  
+  // Write raw pixel data
+  file.write(buf, width * height);
+  file.close();
+  
+  return true;
+}
+
+// Generate unique filename for inference image based on timestamp
+String generateInferenceFilename(const String& result) {
+  static unsigned long imageCounter = 0;
+  imageCounter++;
+  
+  // Format: /inference/HHMMSS_result_counter.pgm
+  unsigned long uptime = millis() / 1000;
+  int hours = (uptime / 3600) % 24;
+  int mins = (uptime / 60) % 60;
+  int secs = uptime % 60;
+  
+  char filename[64];
+  snprintf(filename, sizeof(filename), "/inference/%02d%02d%02d_%s_%04lu.pgm", 
+           hours, mins, secs, result.c_str(), imageCounter);
+  return String(filename);
 }
 
 void enableFlap() {
@@ -1787,7 +1831,7 @@ void handleInferenceTopic(String inferenceStr) {
   } else if (inferenceStr == "unknow_cat_entering") {
     /* code */
   } else if (inferenceStr == "prey") {
-    //handleFlapStateCommand("OFF");
+    handleFlapStateCommand("OFF");
   }
 }
 
@@ -2330,6 +2374,41 @@ void setupWebServer() {
     request->send(200, "text/plain", status);
   });
   
+  // List inference images
+  server.on("/inference", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!SD.begin()) {
+      request->send(500, "text/plain", "SD card not available");
+      return;
+    }
+    
+    String html = "<html><head><title>Inference Images</title></head><body>";
+    html += "<h1>Inference Images</h1><ul>";
+    
+    File dir = SD.open("/inference");
+    if (dir && dir.isDirectory()) {
+      File file = dir.openNextFile();
+      while (file) {
+        String name = file.name();
+        html += "<li><a href=\"/inference/" + name + "\">" + name + "</a></li>";
+        file = dir.openNextFile();
+      }
+    }
+    html += "</ul></body></html>";
+    request->send(200, "text/html", html);
+  });
+
+  // Serve individual inference images
+  server.on("/inference/*", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String path = request->url();
+    
+    if (!SD.exists(path)) {
+      request->send(404, "text/plain", "File not found");
+      return;
+    }
+    
+    request->send(SD, path, "image/x-portable-graymap");
+  });
+
   server.begin();
   mqttDebugPrintln("HTTP server started");
   Serial.println("HTTP server started on port 80");
