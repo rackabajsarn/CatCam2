@@ -226,7 +226,8 @@ void savePresetToEEPROM(uint8_t presetIndex);
 void applyPresetFromEEPROM(uint8_t presetIndex);
 void handleModelSourceCommand(String stateStr);
 void handleInferenceModeCommand(String modeStr);
-
+bool saveGrayscaleToSD(uint8_t* buf, int width, int height, const char* filename);
+String generateInferenceFilename(const String& result);
 // Add more handler functions as needed
 
 WiFiClient espClient;
