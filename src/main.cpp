@@ -857,23 +857,23 @@ bool updateModelFromSD() {
 void reloadModel() {
   // Reload from SD and reinitialize interpreter
   if (!adoptFileModel("/model.tflite")) {
-    Serial.println("Failed to load the new model from SD");
+    mqttDebugPrintf("Failed to load the new model from SD");
     return;
   }
   if (!setupInference()) {
-    Serial.println("Failed to reinitialize inference with the new model");
+    mqttDebugPrintf("Failed to reinitialize inference with the new model");
   } else {
-    Serial.println("New model loaded and interpreter reinitialized.");
+    mqttDebugPrintln("New model loaded and interpreter reinitialized.");
   }
 }
 
 // Setup function to initialize the model and interpreter.
 bool setupInference() {
-  Serial.println("Setting up inference...");
+  mqttDebugPrintln("Setting up inference...");
   // Load the model from flash.
   model = tflite::GetModel(g_model_data);
   if (model->version() != TFLITE_SCHEMA_VERSION) {
-    Serial.printf("Model schema version (%d) does not match TFLite Micro schema version (%d).\n",
+    mqttDebugPrintf("Model schema version (%d) does not match TFLite Micro schema version (%d).\n",
                   model->version(), TFLITE_SCHEMA_VERSION);
     return false;
   }
@@ -888,11 +888,11 @@ bool setupInference() {
   // Allocate tensors.
   TfLiteStatus allocate_status = interpreter->AllocateTensors();
   if (allocate_status != kTfLiteOk) {
-    Serial.println("AllocateTensors() failed");
+    mqttDebugPrintln("AllocateTensors() failed");
     return false;
   }
   
-  Serial.println("Inference setup complete.");
+  mqttDebugPrintln("Inference setup complete.");
   return true;
 }
 
@@ -902,7 +902,7 @@ bool run_inference(uint8_t* input_data, size_t input_data_size) {
   // Get the model's input tensor.
   TfLiteTensor* input = interpreter->input(0);
   if (input_data_size != input->bytes) {
-    Serial.printf("Input data size (%d) does not match model input size (%d)\n",
+    mqttDebugPrintf("Input data size (%d) does not match model input size (%d)\n",
                   input_data_size, input->bytes);
     return false;  // or handle the error as needed
   }
@@ -913,7 +913,7 @@ bool run_inference(uint8_t* input_data, size_t input_data_size) {
   // Run inference.
   TfLiteStatus invoke_status = interpreter->Invoke();
   if (invoke_status != kTfLiteOk) {
-    Serial.println("Invoke failed");
+    mqttDebugPrintf("Invoke failed");
     return false;
   }
   
