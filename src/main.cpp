@@ -921,9 +921,10 @@ bool run_inference(uint8_t* input_data, size_t input_data_size) {
   TfLiteTensor* output = interpreter->output(0);
   
   // For a two-element output:
-  // output->data.uint8[0] is the score for "no prey"
-  // output->data.uint8[1] is the score for "prey"
-  bool preyDetected = output->data.uint8[1] > output->data.uint8[0];
+  // output->data.uint8[0] is the score for "prey"
+  // output->data.uint8[1] is the score for "not_prey"
+  // output->data.uint8[2] is the score for "not_cat" if used
+  bool preyDetected = output->data.uint8[0] > output->data.uint8[1];
   
   return preyDetected;
 }
