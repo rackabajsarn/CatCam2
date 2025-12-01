@@ -12,13 +12,12 @@
 #include "esp_wifi.h"
 #include "esp_heap_caps.h"
 #include <ArduTFLite.h>
-#include "model.h"
-#include <SD.h>
+#include <SD_MMC.h>
 #include <SPI.h>
 #include <ESPAsyncWebServer.h>
 #include <Update.h>
 // TensorFlow Lite Micro headers
-#include "tensorflow/lite/micro/all_ops_resolver.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 //#include "tensorflow/lite/version.h"
@@ -67,8 +66,6 @@ const char* password = WIFI_PASSWORD;
 #define SET_BRIGHTNESS_TOPIC "catflap/brightness/set"
 #define SET_CONTRAST_TOPIC "catflap/contrast/set"
 #define SET_AWB_TOPIC "catflap/awb/set"
-#define MODEL_SOURCE_TOPIC "catflap/model_source"
-#define SET_MODEL_SOURCE_TOPIC "catflap/model_source/set"
 #define INFERENCE_MODE_TOPIC "catflap/inference_mode"
 #define SET_INFERENCE_MODE_TOPIC "catflap/inference_mode/set"
 #define ESP32_INFERENCE_TOPIC "catflap/esp32_inference"
@@ -224,7 +221,6 @@ bool isEEPROMInitialized();
 void initializeEEPROM();
 void savePresetToEEPROM(uint8_t presetIndex);
 void applyPresetFromEEPROM(uint8_t presetIndex);
-void handleModelSourceCommand(String stateStr);
 void handleInferenceModeCommand(String modeStr);
 bool saveGrayscaleToSD(uint8_t* buf, int width, int height, const char* filename);
 String generateInferenceFilename(const String& result);
@@ -242,7 +238,6 @@ bool catLocation = true; // true = home
 bool barrierTriggered = false;  // Flag to indicate barrier has been triggered
 bool barrierStableState = false; // Last confirmed stable state (false = not broken, true = broken)
 esp_err_t cameraInitStatus = ESP_FAIL;
-bool useLocalModel = true;  // Default to local model.cc when no SD card
 uint8_t inferenceMode = INFERENCE_MODE_BOTH; // Default to both
 
 // Model comparison tracking
@@ -290,40 +285,29 @@ static uint32_t g_pulseQualitySamples = 0;
 
 
 // The Tensor Arena memory area is used by TensorFlow Lite to store input, output and intermediate tensors
-// It must be defined as a global array of byte (or u_int8 which is the same type on Arduino) 
-// The Tensor Arena size must be defined by trials and errors. We use here a quite large value.
-// The alignas(16) directive is used to ensure that the array is aligned on a 16-byte boundary,
-// this is important for performance and to prevent some issues on ARM microcontroller architectures.
-// Adjust this based on your model's requirements.
-constexpr int kTensorArenaSize = 20 * 1024;  // For example, 20KB; adjust as needed.
-uint8_t tensor_arena[kTensorArenaSize];
+// Allocated in PSRAM at runtime for larger capacity.
+// Adjust size based on your model's requirements.
+constexpr int kTensorArenaSize = 150 * 1024;  // 150KB in PSRAM
+uint8_t* tensor_arena = nullptr;
 
 // Global pointers for the model and interpreter.
 const tflite::Model* model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
+bool g_model_loaded = false; // True if model loaded successfully
 
-// Global pointer to the active model (embedded flash or owned heap).
+// Global pointer to the active model data (owned heap buffer from SD).
 const uint8_t* g_model_data = nullptr;
 size_t g_model_size = 0;
-// If non-null, this holds a heap/PSRAM-allocated model we own and must free on switch.
+// If non-null, this holds a heap/PSRAM-allocated model we own and must free on reload.
 static uint8_t* g_owned_heap_model = nullptr;
 
-
-// -------- Model ownership helpers (safe switching between embedded and SD) --------
+// -------- Model ownership helpers (SD-only model) --------
 static void freeOwnedModel()
 {
   if (g_owned_heap_model) {
     heap_caps_free(g_owned_heap_model);
     g_owned_heap_model = nullptr;
   }
-}
-
-static void adoptEmbeddedModel()
-{
-  freeOwnedModel();
-  g_model_data = my_model_quant_tflite;
-  g_model_size = my_model_quant_tflite_len;
-  useLocalModel = true;
 }
 
 static bool adoptFileModel(const char* path)
@@ -343,7 +327,6 @@ static bool adoptFileModel(const char* path)
   g_owned_heap_model = buf;
   g_model_data = buf;   // const pointer to owned heap
   g_model_size = sz;
-  useLocalModel = false;
   return true;
 }
 // -------------------------------------------------------------------------------
@@ -352,24 +335,29 @@ void setup() {
   Serial.begin(115200);
   delay(1000);  // Wait for Serial
   
-  // Initialize SD card but don't fail if not present
-if (!SD.begin()) {
-  mqttDebugPrintln("SD card initialization failed - using embedded model");
-  useLocalModel = true;
-}
-
-// Select model based on flag
-if (!useLocalModel) {
-  if (!adoptFileModel("/model.tflite")) {
-    mqttDebugPrintln("Model loading from SD failed - falling back to embedded model");
-    adoptEmbeddedModel();
-  } else {
-    mqttDebugPrintln("Using SD card model");
+  // Allocate tensor arena in PSRAM
+  tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!tensor_arena) {
+    Serial.println("Failed to allocate tensor arena in PSRAM!");
   }
-} else {
-  adoptEmbeddedModel();
-  mqttDebugPrintln("Using embedded model");
-}
+  bool sdFailed = false;
+  bool modelFailed = false;
+  // Initialize SD card and load model from SD
+  if (!SD_MMC.begin("/sdcard", true)) {
+    g_model_loaded = false;
+    sdFailed = true;
+  } else {
+    if (!adoptFileModel("/model.tflite")) {
+      modelFailed = true;
+      g_model_loaded = false;
+    } else {
+      mqttDebugPrintln("Using SD card model");
+      g_model_loaded = true;
+    }
+  }
+// IMPORTANT: Before any inference or model use, check g_model_loaded
+// Example:
+//   if (!g_model_loaded) return; // or skip inference
 
   cameraInitStatus = initCamera();
   
@@ -425,7 +413,8 @@ if (!useLocalModel) {
   mqttInitialPublish();
 
   setupInference();
-
+  if (sdFailed) mqttDebugPrintln("SD card initialization failed - local inference disabled");
+  if (modelFailed) mqttDebugPrintln("Model loading from SD failed - local inference disabled");
   mqttDebugPrintln("ESP Setup finished");
   mqttDebugPrintf("Camera init: 0x%x (%s)\n",
                 cameraInitStatus,
@@ -726,7 +715,6 @@ void mqttSubscribe() {
     client.subscribe(SET_COOLDOWN_TOPIC);
     client.subscribe(SET_FLAP_STATE_TOPIC);
     client.subscribe(SET_CAT_LOCATION_TOPIC);
-    client.subscribe(SET_MODEL_SOURCE_TOPIC);
     client.subscribe(SET_AE_LEVEL_TOPIC);
     client.subscribe(SET_AEC_VALUE_TOPIC);
     client.subscribe(SET_EXPOSURE_CTRL_TOPIC);
@@ -797,7 +785,7 @@ esp_err_t initCamera() {
 
 // Function to load the model file from the SD card into memory.
 bool loadModelFromSD(const char* modelPath, uint8_t** modelBuffer, size_t* modelSize) {
-  File modelFile = SD.open(modelPath, FILE_READ);
+  File modelFile = SD_MMC.open(modelPath, FILE_READ);
   if (!modelFile) {
     Serial.println("Failed to open model file on SD card");
     return false;
@@ -828,9 +816,9 @@ bool loadModelFromSD(const char* modelPath, uint8_t** modelBuffer, size_t* model
 
 bool updateModelFromSD() {
   // Check if a new model file exists, e.g. "model_new.tflite"
-  if (SD.exists("/model_new.tflite")) {
+  if (SD_MMC.exists("/model_new.tflite")) {
     // Optional: Validate the new file (size, checksum, etc.)
-    File newModel = SD.open("/model_new.tflite", FILE_READ);
+    File newModel = SD_MMC.open("/model_new.tflite", FILE_READ);
     if (!newModel) {
       Serial.println("Failed to open new model file.");
       return false;
@@ -839,12 +827,12 @@ bool updateModelFromSD() {
     newModel.close();
     
     // Remove the old model file.
-    if (SD.exists("/model.tflite")) {
-      SD.remove("/model.tflite");
+    if (SD_MMC.exists("/model.tflite")) {
+      SD_MMC.remove("/model.tflite");
     }
 
     // If validation passes, rename the file.
-    if (SD.rename("/model_new.tflite", "/model.tflite")) {
+    if (SD_MMC.rename("/model_new.tflite", "/model.tflite")) {
       Serial.println("Model updated successfully.");
       return true;
     } else {
@@ -869,17 +857,35 @@ void reloadModel() {
 
 // Setup function to initialize the model and interpreter.
 bool setupInference() {
+  if (!g_model_loaded || g_model_data == nullptr) {
+    mqttDebugPrintln("Inference setup skipped: model not loaded.");
+    return false;
+  }
   mqttDebugPrintln("Setting up inference...");
   // Load the model from flash.
   model = tflite::GetModel(g_model_data);
+  if (model == nullptr) {
+    mqttDebugPrintln("GetModel returned nullptr. Model data invalid.");
+    return false;
+  }
   if (model->version() != TFLITE_SCHEMA_VERSION) {
     mqttDebugPrintf("Model schema version (%d) does not match TFLite Micro schema version (%d).\n",
                   model->version(), TFLITE_SCHEMA_VERSION);
     return false;
   }
   
-  // Create an op resolver.
-  static tflite::AllOpsResolver resolver;
+  // Create an op resolver with only the ops our model needs.
+  static tflite::MicroMutableOpResolver<10> resolver;
+  resolver.AddCast();
+  resolver.AddQuantize();
+  resolver.AddDepthwiseConv2D();
+  resolver.AddConv2D();
+  resolver.AddMul();
+  resolver.AddAdd();
+  resolver.AddMaxPool2D();
+  resolver.AddMean();
+  resolver.AddFullyConnected();
+  resolver.AddSoftmax();
   
   // Create a persistent interpreter.
   static tflite::MicroInterpreter static_interpreter(model, resolver, tensor_arena, kTensorArenaSize);
@@ -891,7 +897,8 @@ bool setupInference() {
     mqttDebugPrintln("AllocateTensors() failed");
     return false;
   }
-  
+  size_t used = interpreter->arena_used_bytes();
+  mqttDebugPrintf("Tensor arena: used %d of %d bytes\n", used, kTensorArenaSize);
   mqttDebugPrintln("Inference setup complete.");
   return true;
 }
@@ -899,27 +906,35 @@ bool setupInference() {
 // Run inference using the persistent interpreter.
 // 'input_data' must match the model's expected input size.
 bool run_inference(uint8_t* input_data, size_t input_data_size) {
+  if (!g_model_loaded || interpreter == nullptr) {
+    mqttDebugPrintln("run_inference: Model not loaded or interpreter not initialized.");
+    return false;
+  }
   // Get the model's input tensor.
   TfLiteTensor* input = interpreter->input(0);
+  if (input == nullptr) {
+    mqttDebugPrintln("run_inference: input tensor is nullptr.");
+    return false;
+  }
   if (input_data_size != input->bytes) {
     mqttDebugPrintf("Input data size (%d) does not match model input size (%d)\n",
                   input_data_size, input->bytes);
     return false;  // or handle the error as needed
   }
-  
   // Copy the input data into the input tensor.
   memcpy(input->data.uint8, input_data, input_data_size);
-  
   // Run inference.
   TfLiteStatus invoke_status = interpreter->Invoke();
   if (invoke_status != kTfLiteOk) {
     mqttDebugPrintf("Invoke failed");
     return false;
   }
-  
   // Get the output tensor.
   TfLiteTensor* output = interpreter->output(0);
-  
+  if (output == nullptr) {
+    mqttDebugPrintln("run_inference: output tensor is nullptr.");
+    return false;
+  }
   // For a two-element output:
   // output->data.uint8[0] is the score for "prey"
   // output->data.uint8[1] is the score for "not_prey"
@@ -1142,11 +1157,11 @@ camera_fb_t* resizeFrame(camera_fb_t *cropped) {
 // Function to save a grayscale image to SD card as raw or PGM format
 // filename should include extension (e.g., "/inference/img_001.pgm")
 bool saveGrayscaleToSD(uint8_t* buf, int width, int height, const char* filename) {
-  if (!SD.exists("/inference")) {
-    SD.mkdir("/inference");
+  if (!SD_MMC.exists("/inference")) {
+    SD_MMC.mkdir("/inference");
   }
   
-  File file = SD.open(filename, FILE_WRITE);
+  File file = SD_MMC.open(filename, FILE_WRITE);
   if (!file) {
     mqttDebugPrintln("Failed to open file for writing");
     return false;
@@ -1249,8 +1264,6 @@ void handleMqttMessages(char* topic, byte* payload, unsigned int length) {
     handleServerInference(incomingMessage);
   } else if (String(topic) == SET_CAT_LOCATION_TOPIC) {
     handleCatLocationCommand(incomingMessage);
-  } else if (String(topic) == SET_MODEL_SOURCE_TOPIC) {
-    handleModelSourceCommand(incomingMessage);
   } else if (String(topic) == SET_INFERENCE_MODE_TOPIC) {
     handleInferenceModeCommand(incomingMessage);
   } else {
@@ -1788,21 +1801,6 @@ void publishDiscoveryConfigs() {
   serializeJson(looptimeSensorConfig, looptimeSensorConfigPayload);
   client.publish(looptimeSensorConfigTopic.c_str(), looptimeSensorConfigPayload.c_str(), true);
 
-  // Model Source Switch
-  String modelSourceConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + DEVICE_NAME + "/model_source/config";
-  DynamicJsonDocument modelSourceConfig(512);
-  modelSourceConfig["name"] = "Use SD Card Model";
-  modelSourceConfig["command_topic"] = SET_MODEL_SOURCE_TOPIC;
-  modelSourceConfig["state_topic"] = MODEL_SOURCE_TOPIC;
-  modelSourceConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_model_source";
-  modelSourceConfig["payload_on"] = "ON";
-  modelSourceConfig["payload_off"] = "OFF";
-  JsonObject deviceInfoModelSource = modelSourceConfig.createNestedObject("device");
-  deviceInfoModelSource["identifiers"] = DEVICE_UNIQUE_ID;
-  String modelSourceConfigPayload;
-  serializeJson(modelSourceConfig, modelSourceConfigPayload);
-  client.publish(modelSourceConfigTopic.c_str(), modelSourceConfigPayload.c_str(), true);
-
   // Inference Mode Select
   String inferenceModeConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/select/" + DEVICE_NAME + "/inference_mode/config";
   DynamicJsonDocument inferenceModeConfig(capacity);
@@ -2289,14 +2287,14 @@ void setupWebServer() {
         mqttDebugPrintln("Starting model upload...");
         totalSize = 0;
         
-        if (!SD.begin()) {
+        if (!SD_MMC.begin("/sdcard", true)) {
           mqttDebugPrintln("SD card not available for upload");
           request->send(500, "text/plain", "SD card not available");
           return;
         }
         
         // Open temp file for writing
-        uploadFile = SD.open(tempPath, FILE_WRITE);
+        uploadFile = SD_MMC.open(tempPath, FILE_WRITE);
         if (!uploadFile) {
           mqttDebugPrintln("Failed to create temp model file");
           request->send(500, "text/plain", "Failed to create temp file");
@@ -2316,11 +2314,11 @@ void setupWebServer() {
         mqttDebugPrintf("Model upload complete: %d bytes\n", totalSize);
         
         // Validate the model file
-        File modelFile = SD.open(tempPath, FILE_READ);
+        File modelFile = SD_MMC.open(tempPath, FILE_READ);
         if (!modelFile) {
           mqttDebugPrintln("Failed to open uploaded model for validation");
           request->send(500, "text/plain", "Upload failed - validation error");
-          SD.remove(tempPath);
+          SD_MMC.remove(tempPath);
           return;
         }
         
@@ -2329,7 +2327,7 @@ void setupWebServer() {
         if (fileSize < 1000 || fileSize > 2 * 1024 * 1024) {  // Between 1KB and 2MB
           mqttDebugPrintf("Invalid model size: %d bytes\n", fileSize);
           modelFile.close();
-          SD.remove(tempPath);
+          SD_MMC.remove(tempPath);
           request->send(400, "text/plain", "Invalid model size");
           return;
         }
@@ -2342,25 +2340,22 @@ void setupWebServer() {
         // TFLite files have "TFL3" at offset 4-7
         if (!(header[4] == 'T' && header[5] == 'F' && header[6] == 'L' && header[7] == '3')) {
           mqttDebugPrintln("Invalid TFLite model format");
-          SD.remove(tempPath);
+          SD_MMC.remove(tempPath);
           request->send(400, "text/plain", "Invalid TFLite format");
           return;
         }
         
         // Model is valid, replace the old one
-        if (SD.exists("/model.tflite")) {
-          SD.remove("/model.tflite");
+        if (SD_MMC.exists("/model.tflite")) {
+          SD_MMC.remove("/model.tflite");
         }
-        SD.rename(tempPath, "/model.tflite");
+        SD_MMC.rename(tempPath, "/model.tflite");
         
         mqttDebugPrintln("New model installed successfully!");
         client.publish(DEBUG_TOPIC, "New model uploaded and validated", false);
         
-        // Optionally reload the model if using SD card model
-        if (!useLocalModel) {
-          // Trigger model reload
-          handleModelSourceCommand("ON");
-        }
+        // Reload the model from SD
+        reloadModel();
         
         request->send(200, "text/plain", "Model uploaded successfully");
       }
@@ -2370,7 +2365,7 @@ void setupWebServer() {
   // Simple health check endpoint
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
     String status = "OK";
-    status += "\nModel: " + String(useLocalModel ? "Embedded" : "SD Card");
+    status += "\nModel: SD Card";
     status += "\nFree Heap: " + String(ESP.getFreeHeap());
     status += "\nUptime: " + String(millis() / 1000) + "s";
     request->send(200, "text/plain", status);
@@ -2378,22 +2373,18 @@ void setupWebServer() {
   
   // List inference images
   server.on("/inference", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!SD.begin()) {
-      request->send(500, "text/plain", "SD card not available");
-      return;
-    }
-    
     String html = "<html><head><title>Inference Images</title></head><body>";
     html += "<h1>Inference Images</h1><ul>";
-    
-    File dir = SD.open("/inference");
-    if (dir && dir.isDirectory()) {
-      File file = dir.openNextFile();
-      while (file) {
-        String name = file.name();
-        html += "<li><a href=\"/inference/" + name + "\">" + name + "</a></li>";
-        file = dir.openNextFile();
-      }
+    File dir = SD_MMC.open("/inference");
+    if (!dir || !dir.isDirectory()) {
+      request->send(500, "text/plain", "SD card not available or /inference directory missing");
+      return;
+    }
+    File file = dir.openNextFile();
+    while (file) {
+      String name = file.name();
+      html += "<li><a href=\"/inference/" + name + "\">" + name + "</a></li>";
+      file = dir.openNextFile();
     }
     html += "</ul></body></html>";
     request->send(200, "text/html", html);
@@ -2403,12 +2394,12 @@ void setupWebServer() {
   server.on("/inference/*", HTTP_GET, [](AsyncWebServerRequest *request) {
     String path = request->url();
     
-    if (!SD.exists(path)) {
+    if (!SD_MMC.exists(path)) {
       request->send(404, "text/plain", "File not found");
       return;
     }
     
-    request->send(SD, path, "image/x-portable-graymap");
+    request->send(SD_MMC, path, "image/x-portable-graymap");
   });
 
   server.begin();
@@ -2770,35 +2761,6 @@ void handleCameraPresetSave() {
   mqttDebugPrintln("Camera preset saved to EEPROM");
 
   lastSettingsChangeTime = millis();
-}
-
-void handleModelSourceCommand(String stateStr) {
-    bool wantSD = stateStr.equalsIgnoreCase("ON");
-
-    if (wantSD) {
-        if (!SD.begin()) {
-            mqttDebugPrintln("Cannot switch to SD card model: No SD card found");
-            client.publish(MODEL_SOURCE_TOPIC, "OFF", true);
-            return;
-        }
-        if (!adoptFileModel("/model.tflite")) {
-            mqttDebugPrintln("Model loading from SD failed - staying on embedded model");
-            adoptEmbeddedModel();
-            client.publish(MODEL_SOURCE_TOPIC, "OFF", true);
-        } else {
-            client.publish(MODEL_SOURCE_TOPIC, "ON", true);
-            mqttDebugPrintln("Using SD card model");
-        }
-    } else {
-        adoptEmbeddedModel();
-        client.publish(MODEL_SOURCE_TOPIC, "OFF", true);
-        mqttDebugPrintln("Using embedded model");
-    }
-
-    // Reinitialize the interpreter with the new model
-    if (!setupInference()) {
-        mqttDebugPrintln("Failed to reinitialize inference after model switch");
-    }
 }
 
 void handleInferenceModeCommand(String modeStr) {
