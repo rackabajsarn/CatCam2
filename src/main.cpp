@@ -286,8 +286,8 @@ static uint32_t g_pulseQualitySamples = 0;
 
 // The Tensor Arena memory area is used by TensorFlow Lite to store input, output and intermediate tensors
 // Allocated in PSRAM at runtime for larger capacity.
-// Adjust size based on your model's requirements.
-constexpr int kTensorArenaSize = 150 * 1024;  // 150KB in PSRAM
+// Bumped to fit current model tensors.
+constexpr int kTensorArenaSize = 600 * 1024;  // 600KB in PSRAM
 uint8_t* tensor_arena = nullptr;
 
 // Global pointers for the model and interpreter.
@@ -856,11 +856,14 @@ bool updateModelFromSD() {
 
 void reloadModel() {
   // Reload from SD and reinitialize interpreter
+  g_model_loaded = false;
   if (!adoptFileModel("/model.tflite")) {
     mqttDebugPrintf("Failed to load the new model from SD");
     return;
   }
+  g_model_loaded = true;
   if (!setupInference()) {
+    g_model_loaded = false;
     mqttDebugPrintf("Failed to reinitialize inference with the new model");
   } else {
     mqttDebugPrintln("New model loaded and interpreter reinitialized.");
