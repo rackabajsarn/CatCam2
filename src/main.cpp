@@ -119,7 +119,7 @@ const char* password = WIFI_PASSWORD;
 #define ENABLE_FLAP_PIN 33
 
 #define BPP 1  // Grayscale: 1 byte per pixel
-#define IR_PWM_PIN 14
+#define IR_PWM_PIN 13
 #define IR_PWM_CH  2
 #define IR_FREQ    38000
 #define IR_DUTY    128
@@ -294,6 +294,7 @@ uint8_t* tensor_arena = nullptr;
 const tflite::Model* model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
 bool g_model_loaded = false; // True if model loaded successfully
+bool g_sd_ready = false;     // True if SD card initialized and mounted
 
 // Global pointer to the active model data (owned heap buffer from SD).
 const uint8_t* g_model_data = nullptr;
@@ -343,10 +344,24 @@ void setup() {
   bool sdFailed = false;
   bool modelFailed = false;
   // Initialize SD card and load model from SD
+  // Initialize SD card and load model from SD
   if (!SD_MMC.begin("/sdcard", true)) {
     g_model_loaded = false;
     sdFailed = true;
+    g_sd_ready = false;
   } else {
+    g_sd_ready = true;
+    uint8_t cardType = SD_MMC.cardType();
+    uint64_t cardSizeMB = SD_MMC.cardSize() / (1024 * 1024);
+    Serial.printf("SD card type: %d, size: %llu MB\n", cardType, (unsigned long long)cardSizeMB);
+    mqttDebugPrintf("SD card mounted: type %d, %llu MB\n", cardType, (unsigned long long)cardSizeMB);
+    // Ensure inference folder exists for saved frames/web listing
+    if (!SD_MMC.exists("/inference")) {
+      if (!SD_MMC.mkdir("/inference")) {
+        mqttDebugPrintln("Failed to create /inference directory on SD");
+        Serial.println("Failed to create /inference directory on SD");
+      }
+    }
     if (!adoptFileModel("/model.tflite")) {
       modelFailed = true;
       g_model_loaded = false;
@@ -355,10 +370,6 @@ void setup() {
       g_model_loaded = true;
     }
   }
-// IMPORTANT: Before any inference or model use, check g_model_loaded
-// Example:
-//   if (!g_model_loaded) return; // or skip inference
-
   cameraInitStatus = initCamera();
   
   EEPROM.begin(EEPROM_SIZE);
@@ -815,6 +826,7 @@ bool loadModelFromSD(const char* modelPath, uint8_t** modelBuffer, size_t* model
 }
 
 bool updateModelFromSD() {
+  if (!g_sd_ready) return false;
   // Check if a new model file exists, e.g. "model_new.tflite"
   if (SD_MMC.exists("/model_new.tflite")) {
     // Optional: Validate the new file (size, checksum, etc.)
@@ -1157,6 +1169,9 @@ camera_fb_t* resizeFrame(camera_fb_t *cropped) {
 // Function to save a grayscale image to SD card as raw or PGM format
 // filename should include extension (e.g., "/inference/img_001.pgm")
 bool saveGrayscaleToSD(uint8_t* buf, int width, int height, const char* filename) {
+  if (!g_sd_ready) {
+    return false;
+  }
   if (!SD_MMC.exists("/inference")) {
     SD_MMC.mkdir("/inference");
   }
@@ -2286,8 +2301,7 @@ void setupWebServer() {
         // Start of upload
         mqttDebugPrintln("Starting model upload...");
         totalSize = 0;
-        
-        if (!SD_MMC.begin("/sdcard", true)) {
+        if (!g_sd_ready) {
           mqttDebugPrintln("SD card not available for upload");
           request->send(500, "text/plain", "SD card not available");
           return;
@@ -2365,7 +2379,8 @@ void setupWebServer() {
   // Simple health check endpoint
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
     String status = "OK";
-    status += "\nModel: SD Card";
+    status += "\nSD Card ready: " + String(g_sd_ready ? "Yes" : "No");
+    status += "\nModel: " + String(g_model_loaded ? "Loaded" : "Not Loaded");
     status += "\nFree Heap: " + String(ESP.getFreeHeap());
     status += "\nUptime: " + String(millis() / 1000) + "s";
     request->send(200, "text/plain", status);
@@ -2375,6 +2390,19 @@ void setupWebServer() {
   server.on("/inference", HTTP_GET, [](AsyncWebServerRequest *request) {
     String html = "<html><head><title>Inference Images</title></head><body>";
     html += "<h1>Inference Images</h1><ul>";
+    if (!g_sd_ready) {
+      // Try one remount attempt here
+      if (SD_MMC.begin("/sdcard", true)) {
+        g_sd_ready = true;
+        if (!SD_MMC.exists("/inference")) {
+          SD_MMC.mkdir("/inference");
+        }
+      }
+    }
+    if (!g_sd_ready) {
+      request->send(500, "text/plain", "SD card not available");
+      return;
+    }
     File dir = SD_MMC.open("/inference");
     if (!dir || !dir.isDirectory()) {
       request->send(500, "text/plain", "SD card not available or /inference directory missing");
