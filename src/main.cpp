@@ -67,9 +67,8 @@ const char* password = WIFI_PASSWORD;
 
 // GPIO Definitions
 #define IR_PIN 32
-//#define OPEN_SENSOR_PIN 32
-#define ENABLE_FLAP_PIN 33 //TODO: Double check 13 or 14
-#define IR_PWM_PIN 14
+#define ENABLE_FLAP_PIN 33
+#define IR_PWM_PIN 13
 #define IR_PWM_CH  2
 #define IR_FREQ    38000
 #define IR_DUTY    128
