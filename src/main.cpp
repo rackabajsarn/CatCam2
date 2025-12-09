@@ -11,7 +11,9 @@
 //#include "model_handler.h"
 #include "esp_wifi.h"
 #include "esp_heap_caps.h"
-#include <ArduTFLite.h>
+#include "img_converters.h" // For JPEG decoding
+#include "esp_jpg_decode.h" // For JPG_SCALE_4X
+//#include <ArduTFLite.h>
 #include <SD_MMC.h>
 #include <SPI.h>
 #include <ESPAsyncWebServer.h>
@@ -168,7 +170,7 @@ void mqttSubscribe();
 void mqttInitialPublish();
 esp_err_t initCamera();
 void captureAndSendImage();
-void processCroppedAndConvert(camera_fb_t *cropped);
+uint8_t* jpegToGrayscale(const uint8_t* jpg_buf, size_t jpg_len, int* out_width, int* out_height);
 
 camera_fb_t* cropImage(camera_fb_t *fb);
 camera_fb_t* resizeImage(camera_fb_t *cropped, int originalSize, int targetSize);
@@ -265,6 +267,11 @@ unsigned long triggerStartTime = 0;      // IR barrier becomes stably broken
 unsigned long captureStartTime = 0;      // captureAndSendImage() entry
 unsigned long captureEndTime = 0;        // after successful capture
 unsigned long sendEndTime = 0;           // after MQTT image publish
+// Local inference timing breakdown
+unsigned long decodeStartTime = 0;       // JPEG decode start
+unsigned long decodeEndTime = 0;         // JPEG decode complete
+unsigned long cropResizeEndTime = 0;     // crop + resize complete
+unsigned long inferenceEndTime = 0;      // TFLite inference complete
 
 // Debounce and Cooldown Settings
 float cooldownDuration = 0.0;    // Cooldown duration in seconds (default to 0)
@@ -285,10 +292,12 @@ static uint32_t g_pulseQualitySamples = 0;
 
 
 // The Tensor Arena memory area is used by TensorFlow Lite to store input, output and intermediate tensors
-// Allocated in PSRAM at runtime for larger capacity.
-// Bumped to fit current model tensors.
-constexpr int kTensorArenaSize = 600 * 1024;  // 600KB in PSRAM
+// Try internal RAM first (much faster), fall back to PSRAM if needed.
+constexpr int kTensorArenaSizeInternal = 200 * 1024;  // 200KB - try internal RAM
+constexpr int kTensorArenaSizePSRAM = 600 * 1024;     // 600KB - fallback to PSRAM
+int kTensorArenaSize = 0;  // Actual allocated size
 uint8_t* tensor_arena = nullptr;
+bool tensor_arena_in_psram = false;
 
 // Global pointers for the model and interpreter.
 const tflite::Model* model = nullptr;
@@ -336,10 +345,22 @@ void setup() {
   Serial.begin(115200);
   delay(1000);  // Wait for Serial
   
-  // Allocate tensor arena in PSRAM
-  tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!tensor_arena) {
-    Serial.println("Failed to allocate tensor arena in PSRAM!");
+  // Try internal RAM first (10x faster for inference)
+  tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSizeInternal, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (tensor_arena) {
+    kTensorArenaSize = kTensorArenaSizeInternal;
+    tensor_arena_in_psram = false;
+    Serial.printf("Tensor arena in INTERNAL RAM: %d KB\n", kTensorArenaSize / 1024);
+  } else {
+    // Fall back to PSRAM
+    tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSizePSRAM, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (tensor_arena) {
+      kTensorArenaSize = kTensorArenaSizePSRAM;
+      tensor_arena_in_psram = true;
+      Serial.printf("Tensor arena in PSRAM: %d KB (slower)\n", kTensorArenaSize / 1024);
+    } else {
+      Serial.println("Failed to allocate tensor arena!");
+    }
   }
   bool sdFailed = false;
   bool modelFailed = false;
@@ -776,8 +797,8 @@ esp_err_t initCamera() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_GRAYSCALE;
-  config.fb_location = CAMERA_FB_IN_PSRAM;  // Use internal DRAM
+  config.pixel_format = PIXFORMAT_JPEG;  // Use JPEG format
+  config.fb_location = CAMERA_FB_IN_PSRAM;
 
   // Frame parameters
   config.frame_size   = FRAMESIZE_VGA;
@@ -791,6 +812,13 @@ esp_err_t initCamera() {
     Serial.printf("Camera init failed with error 0x%x", err);
     //ESP.restart();
   }
+  
+  // Apply grayscale effect (special_effect 2 = grayscale)
+  sensor_t *s = esp_camera_sensor_get();
+  if (s) {
+    s->set_special_effect(s, 2);  // 0=No Effect, 1=Negative, 2=Grayscale, 3=Red Tint, etc.
+  }
+  
   return err;
 }
 
@@ -909,11 +937,15 @@ bool setupInference() {
   // Allocate tensors.
   TfLiteStatus allocate_status = interpreter->AllocateTensors();
   if (allocate_status != kTfLiteOk) {
-    mqttDebugPrintln("AllocateTensors() failed");
+    mqttDebugPrintf("AllocateTensors() failed! Arena %dKB in %s may be too small\n",
+                    kTensorArenaSize / 1024,
+                    tensor_arena_in_psram ? "PSRAM" : "internal RAM");
     return false;
   }
   size_t used = interpreter->arena_used_bytes();
-  mqttDebugPrintf("Tensor arena: used %d of %d bytes\n", used, kTensorArenaSize);
+  mqttDebugPrintf("Tensor arena: %d/%d KB used (%s)\n", 
+                  used / 1024, kTensorArenaSize / 1024,
+                  tensor_arena_in_psram ? "PSRAM - SLOW" : "internal RAM - FAST");
   mqttDebugPrintln("Inference setup complete.");
   return true;
 }
@@ -959,35 +991,204 @@ bool run_inference(uint8_t* input_data, size_t input_data_size) {
   return preyDetected;
 }
 
-// Function to process the cropped frame and convert it to JPEG.
-void processCroppedAndConvert(camera_fb_t *cropped) {
-  uint8_t *jpg_buf = NULL;
-  size_t jpg_len = 0;
-  
-  // Convert the grayscale frame to JPEG
-  // Quality 12 is decent
-  bool converted = frame2jpg(cropped, 12, &jpg_buf, &jpg_len);
-  
-  // Free the original grayscale buffer (allocated in PSRAM)
-  if (cropped->buf) {
-    heap_caps_free(cropped->buf);
-    cropped->buf = NULL;
+// -------- JPEG Decode Infrastructure --------
+// Allocate for FULL VGA size to be safe (esp_jpg_decode scaling may not reduce output)
+// Once working, we can optimize buffer sizes
+static uint8_t* g_rgb_buf = nullptr;      // RGB888 buffer for VGA (640*480*3 = 921600 bytes)
+static uint8_t* g_decoded_gray_buf = nullptr;  // Grayscale buffer (640*480 = 307200 bytes)
+static const int DECODE_WIDTH = 640;   // Full VGA width
+static const int DECODE_HEIGHT = 480;  // Full VGA height
+static const int SENSOR_WIDTH = 640;
+static const int SENSOR_HEIGHT = 480;
+static const size_t DECODE_RGB_SIZE = DECODE_WIDTH * DECODE_HEIGHT * 3;
+static const size_t DECODE_GRAY_SIZE = DECODE_WIDTH * DECODE_HEIGHT;
+
+// Context for esp_jpg_decode callbacks
+typedef struct {
+  const uint8_t* jpg_data;
+  size_t jpg_len;
+  uint8_t* rgb_out;
+  int width;
+  int height;
+  int rgb_index;
+  int blocks_seen;
+  int max_x;
+  int max_y;
+  bool first_block_logged;
+  bool skipped_block;
+} decode_ctx_t;
+
+// Reader callback - feeds JPEG data to decoder
+static size_t decode_reader(void* arg, size_t index, uint8_t* buf, size_t len) {
+  decode_ctx_t* ctx = (decode_ctx_t*)arg;
+
+  // If we've already read everything, signal EOF
+  if (index >= ctx->jpg_len) {
+    return 0;
   }
 
-  if (!converted) {
-    mqttDebugPrintln("JPEG compression failed");
-    cropped->len = 0;
-    cropped->format = PIXFORMAT_GRAYSCALE; // Invalid state really
-    return;
+  size_t remaining = ctx->jpg_len - index;
+  if (len > remaining) {
+    len = remaining;
   }
 
-  // Update the struct to point to the new JPEG buffer
-  // Note: frame2jpg allocates using standard malloc (internal RAM usually)
-  cropped->buf = jpg_buf;
-  cropped->len = jpg_len;
-  cropped->format = PIXFORMAT_JPEG;
+  if (len > 0) {
+    memcpy(buf, ctx->jpg_data + index, len);
+  }
+
+  return len;
+}
+
+// Writer callback - receives decoded RGB blocks
+static bool decode_writer(void* arg, uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t* data) {
+  decode_ctx_t* ctx = (decode_ctx_t*)arg;
+
+  ctx->blocks_seen++;
+  if (!ctx->first_block_logged) {
+    mqttDebugPrintf("decode_writer first block: x=%d y=%d w=%d h=%d\n", x, y, w, h);
+    ctx->first_block_logged = true;
+  }
   
-  mqttDebugPrintf("Converted to JPEG: %u bytes\n", jpg_len);
+  // Safety: if block extends beyond our expected buffer, skip entirely
+  // This prevents heap corruption if decoder outputs larger than expected
+  if (x + w > ctx->width || y + h > ctx->height) {
+    ctx->skipped_block = true;
+    return true;  // Skip this block but continue decoding
+  }
+  
+  // Copy RGB888 block to output buffer at correct position
+  for (uint16_t row = 0; row < h; row++) {
+    uint16_t dst_y = y + row;
+    for (uint16_t col = 0; col < w; col++) {
+      uint16_t dst_x = x + col;
+      
+      int src_idx = (row * w + col) * 3;
+      int dst_idx = (dst_y * ctx->width + dst_x) * 3;
+      
+      ctx->rgb_out[dst_idx]     = data[src_idx];     // R
+      ctx->rgb_out[dst_idx + 1] = data[src_idx + 1]; // G
+      ctx->rgb_out[dst_idx + 2] = data[src_idx + 2]; // B
+    }
+  }
+
+  int block_max_x = x + w;
+  int block_max_y = y + h;
+  if (block_max_x > ctx->max_x) ctx->max_x = block_max_x;
+  if (block_max_y > ctx->max_y) ctx->max_y = block_max_y;
+  return true;
+}
+
+// Decode JPEG to grayscale using esp_jpg_decode
+// Returns pointer to decoded grayscale data or NULL
+uint8_t* jpegToGrayscale(const uint8_t* jpg_buf, size_t jpg_len, int* out_width, int* out_height) {
+  // Allocate RGB buffer if needed (full VGA size to be safe)
+  if (!g_rgb_buf) {
+    g_rgb_buf = (uint8_t*)heap_caps_malloc(DECODE_RGB_SIZE, MALLOC_CAP_SPIRAM);
+    if (!g_rgb_buf) {
+      mqttDebugPrintln("Failed to allocate RGB decode buffer");
+      return nullptr;
+    }
+    mqttDebugPrintf("Allocated RGB buffer: %d bytes\n", DECODE_RGB_SIZE);
+  }
+  
+  // Allocate grayscale buffer if needed
+  if (!g_decoded_gray_buf) {
+    g_decoded_gray_buf = (uint8_t*)heap_caps_malloc(DECODE_GRAY_SIZE, MALLOC_CAP_SPIRAM);
+    if (!g_decoded_gray_buf) {
+      mqttDebugPrintln("Failed to allocate grayscale buffer");
+      return nullptr;
+    }
+    mqttDebugPrintf("Allocated grayscale buffer: %d bytes\n", DECODE_GRAY_SIZE);
+  }
+  
+  // Setup decode context for full VGA output
+  decode_ctx_t ctx;
+  ctx.jpg_data = jpg_buf;
+  ctx.jpg_len = jpg_len;
+  ctx.rgb_out = g_rgb_buf;
+  ctx.width = DECODE_WIDTH;
+  ctx.height = DECODE_HEIGHT;
+  ctx.rgb_index = 0;
+  ctx.blocks_seen = 0;
+  ctx.max_x = 0;
+  ctx.max_y = 0;
+  ctx.first_block_logged = false;
+  ctx.skipped_block = false;
+
+  mqttDebugPrintf("jpegToGrayscale: jpg_len=%d\n", (int)jpg_len);
+  Serial.printf("jpegToGrayscale: jpg_len=%d\n", (int)jpg_len);
+  
+  // Decode JPEG (no scaling to keep dimensions predictable)
+  esp_err_t err = esp_jpg_decode(jpg_len, JPG_SCALE_NONE, decode_reader, decode_writer, &ctx);
+  if (err != ESP_OK) {
+    mqttDebugPrintf("esp_jpg_decode failed: %d\n", err);
+    Serial.printf("esp_jpg_decode failed: %d\n", err);
+    return nullptr;
+  }
+
+  mqttDebugPrintf("jpegToGrayscale: decode OK, blocks=%d, max_x=%d, max_y=%d, skipped=%d\n",
+                  ctx.blocks_seen, ctx.max_x, ctx.max_y, ctx.skipped_block ? 1 : 0);
+  Serial.printf("jpegToGrayscale: decode OK, blocks=%d, max_x=%d, max_y=%d, skipped=%d\n",
+                ctx.blocks_seen, ctx.max_x, ctx.max_y, ctx.skipped_block ? 1 : 0);
+  
+  // Output is full VGA
+  *out_width = DECODE_WIDTH;
+  *out_height = DECODE_HEIGHT;
+
+  // Warn if decoder delivered anything other than 0..width/height coverage
+  if (ctx.max_x > DECODE_WIDTH || ctx.max_y > DECODE_HEIGHT || ctx.skipped_block) {
+    mqttDebugPrintf("jpegToGrayscale WARN: max_x=%d max_y=%d skipped=%d expected<=%d,%d\n",
+                    ctx.max_x, ctx.max_y, ctx.skipped_block ? 1 : 0, DECODE_WIDTH, DECODE_HEIGHT);
+  }
+  
+  // Convert RGB888 to grayscale - just take R channel (all channels same with grayscale effect)
+  for (int i = 0; i < DECODE_GRAY_SIZE; i++) {
+    g_decoded_gray_buf[i] = g_rgb_buf[i * 3];
+  }
+  
+  return g_decoded_gray_buf;
+}
+
+// Fallback decode using esp32-camera's fmt2rgb888 (internal JPEG decoder)
+uint8_t* jpegToGrayscaleFallback(const uint8_t* jpg_buf, size_t jpg_len, int* out_width, int* out_height) {
+  // Allocate RGB buffer if needed (full VGA size to be safe)
+  if (!g_rgb_buf) {
+    g_rgb_buf = (uint8_t*)heap_caps_malloc(DECODE_RGB_SIZE, MALLOC_CAP_SPIRAM);
+    if (!g_rgb_buf) {
+      mqttDebugPrintln("Fallback: Failed to allocate RGB decode buffer");
+      return nullptr;
+    }
+    mqttDebugPrintf("Fallback: Allocated RGB buffer: %d bytes\n", DECODE_RGB_SIZE);
+  }
+
+  // Allocate grayscale buffer if needed
+  if (!g_decoded_gray_buf) {
+    g_decoded_gray_buf = (uint8_t*)heap_caps_malloc(DECODE_GRAY_SIZE, MALLOC_CAP_SPIRAM);
+    if (!g_decoded_gray_buf) {
+      mqttDebugPrintln("Fallback: Failed to allocate grayscale buffer");
+      return nullptr;
+    }
+    mqttDebugPrintf("Fallback: Allocated grayscale buffer: %d bytes\n", DECODE_GRAY_SIZE);
+  }
+
+  mqttDebugPrintf("Fallback: fmt2rgb888 decode start, jpg_len=%d\n", (int)jpg_len);
+  bool ok = fmt2rgb888(jpg_buf, jpg_len, PIXFORMAT_JPEG, g_rgb_buf);
+  if (!ok) {
+    mqttDebugPrintln("Fallback: fmt2rgb888 failed");
+    return nullptr;
+  }
+
+  // Assume full VGA output
+  *out_width = DECODE_WIDTH;
+  *out_height = DECODE_HEIGHT;
+
+  // Convert RGB888 to grayscale (use R channel)
+  for (int i = 0; i < DECODE_GRAY_SIZE; i++) {
+    g_decoded_gray_buf[i] = g_rgb_buf[i * 3];
+  }
+
+  mqttDebugPrintf("Fallback: fmt2rgb888 decode OK, w=%d h=%d\n", *out_width, *out_height);
+  return g_decoded_gray_buf;
 }
 
 void captureAndSendImage() {
@@ -997,98 +1198,113 @@ void captureAndSendImage() {
   }
   captureStartTime = millis();
   irDisableForCritical();
-  delay(5); // Short delay to allow camera to adjust to lighting change. Increase if IR bleed shines through
-  
+  delay(5); // Short delay to allow camera to adjust to lighting change
+
   // First capture to flush the old frame from the buffer
-  camera_fb_t * fb = esp_camera_fb_get();
+  camera_fb_t *fb = esp_camera_fb_get();
   if (fb) {
     esp_camera_fb_return(fb);
   }
-  
-  // Second capture to get the current frame
+
+  // Second capture to get the current frame (JPEG with grayscale effect)
   fb = esp_camera_fb_get();
-  
+
   if (!fb) {
     Serial.println("Camera capture failed");
     mqttDebugPrintln("Camera capture failed");
-    irEnableAfterCritical();  // CRITICAL: Must re-enable IR even on failure
+    irEnableAfterCritical();
     return;
   }
-  
+
   irEnableAfterCritical();  // Re-enable IR as soon as capture completes
-  
-  // Crop the image to a centered 384x384 square in PSRAM.
-  camera_fb_t *cropped = cropFrame(fb);
-  if (!cropped) {
-      esp_camera_fb_return(fb);
-      return;
-  }
   captureEndTime = millis();
 
-  // --- LOCAL INFERENCE PATH ---
-  if (inferenceMode == INFERENCE_MODE_LOCAL || inferenceMode == INFERENCE_MODE_BOTH) {
-    // Resize the cropped image to 96x96 for ESP32 inference.
-    camera_fb_t *resized = resizeFrame(cropped);
-    if (resized) {
-      // Copy resized data to input buffer for inference
-      // The resized image should already be grayscale 96x96
-      memcpy((void*)resized->buf, (const void*)resized->buf, 96 * 96);
-      
-      // Run LOCAL ESP32 inference on 96x96 image for prey/not_prey
-      bool esp32PreyDetected = run_inference(resized->buf, 96 * 96);
-      
-      // Publish ESP32 inference result
-      String esp32Result = esp32PreyDetected ? "prey" : "not_prey";
-      lastESP32Inference = esp32Result;
-      client.publish(ESP32_INFERENCE_TOPIC, esp32Result.c_str(), false);
-      
-      // Make flap decision based on LOCAL inference
-      if (esp32PreyDetected) {
-        handleFlapStateCommand("OFF");
-        mqttDebugPrintln("ESP32: Prey detected - closing flap");
-      } else {
-        handleFlapStateCommand("ON");
-        mqttDebugPrintln("ESP32: No prey - opening flap");
-      }
-      
-      // Save 96x96 inference image to SD card
-      String filename = generateInferenceFilename(esp32Result);
-      saveGrayscaleToSD(resized->buf, 96, 96, filename.c_str());
-      
-      // Free the resized frame's buffer and struct.
-      if (resized->buf) heap_caps_free(resized->buf);
-      heap_caps_free(resized);
-    } else {
-      mqttDebugPrintln("Failed to resize for local inference");
-    }
-  }
-
-  // --- SERVER INFERENCE PATH ---
+  // --- SERVER PATH: Publish raw JPEG immediately (no cropping) ---
   if (inferenceMode == INFERENCE_MODE_SERVER || inferenceMode == INFERENCE_MODE_BOTH) {
-    // Convert cropped 384x384 to JPEG for sending to server
-    processCroppedAndConvert(cropped);
-
-    // Publish the 384x384 image to server via MQTT for detailed inference
     if (client.connected()) {
-      if (client.publish(IMAGE_TOPIC, cropped->buf, cropped->len, true)) {
-        mqttDebugPrintln("Image sent to server for inference");
-      } else {
+      if (!client.publish(IMAGE_TOPIC, fb->buf, fb->len, true)) {
         mqttDebugPrintln("Failed to send image to server");
       }
     }
     sendEndTime = millis();
+    // Full timing printed in handleServerInference() when server responds
   }
 
-  // Free the cropped frame (it might be JPEG now if server path ran, or still grayscale if not)
-  // processCroppedAndConvert uses standard malloc for the new buffer if it converts
-  // cropFrame uses PSRAM malloc
-  
-  if (cropped->format == PIXFORMAT_JPEG) {
-     if (cropped->buf) free(cropped->buf); // frame2jpg uses standard malloc
-  } else {
-     if (cropped->buf) heap_caps_free(cropped->buf); // still in PSRAM
+  // --- LOCAL INFERENCE PATH: Decode JPEG at 1/4 scale → crop center 96x96 → inference ---
+  if (inferenceMode == INFERENCE_MODE_LOCAL || inferenceMode == INFERENCE_MODE_BOTH) {
+    mqttDebugPrintf("LOCAL: starting decode, fb->len=%d\n", fb->len);
+    Serial.printf("LOCAL: starting decode, fb->len=%d\n", fb->len);
+    decodeStartTime = millis();
+    
+    // Decode JPEG to grayscale (full VGA 640x480)
+    int decoded_w = 0, decoded_h = 0;
+    size_t heap_before = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    size_t heap_min_before = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+    mqttDebugPrintf("heap before decode: %u free / %u min\n", (unsigned)heap_before, (unsigned)heap_min_before);
+    // Use fallback decoder directly to avoid esp_jpg_decode hang
+    uint8_t *gray_buf = jpegToGrayscaleFallback(fb->buf, fb->len, &decoded_w, &decoded_h);
+    size_t heap_after = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    size_t heap_min_after = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+    mqttDebugPrintf("heap after decode: %u free / %u min\n", (unsigned)heap_after, (unsigned)heap_min_after);
+    decodeEndTime = millis();
+    mqttDebugPrintf("LOCAL: decode done, gray_buf=%p, w=%d, h=%d\n", gray_buf, decoded_w, decoded_h);
+    Serial.printf("LOCAL: decode done, gray_buf=%p, w=%d, h=%d\n", gray_buf, decoded_w, decoded_h);
+    
+    if (gray_buf && decoded_w == DECODE_WIDTH && decoded_h == DECODE_HEIGHT) {
+      // Crop centered 384x384 from VGA (640x480), then resize to 96x96
+      const int cropSize = 384;
+      const int targetSize = 96;
+      int left = (decoded_w - cropSize) / 2;  // (640-384)/2 = 128
+      int top = (decoded_h - cropSize) / 2;   // (480-384)/2 = 48
+      
+      // Allocate inference buffer
+      uint8_t *inference_buf = (uint8_t*)heap_caps_malloc(targetSize * targetSize, MALLOC_CAP_SPIRAM);
+      if (inference_buf) {
+        // Resize 384x384 to 96x96 using nearest neighbor (4x downscale)
+        for (int y = 0; y < targetSize; y++) {
+          int srcY = top + y * 4;  // Scale factor 4
+          for (int x = 0; x < targetSize; x++) {
+            int srcX = left + x * 4;
+            inference_buf[y * targetSize + x] = gray_buf[srcY * decoded_w + srcX];
+          }
+        }
+        cropResizeEndTime = millis();
+        
+        // Run inference on 96x96 grayscale
+        bool esp32PreyDetected = run_inference(inference_buf, targetSize * targetSize);
+        inferenceEndTime = millis();
+        
+        // Publish result
+        String esp32Result = esp32PreyDetected ? "prey" : "not_prey";
+        lastESP32Inference = esp32Result;
+        client.publish(ESP32_INFERENCE_TOPIC, esp32Result.c_str(), false);
+        
+        // Print LOCAL timing summary
+        mqttDebugPrintf("[TIMER LOCAL] barrier_to_capture=%lu, capture=%lu, decode=%lu, crop=%lu, inference=%lu, total=%lu ms | result=%s\n",
+                        captureStartTime - triggerStartTime,
+                        captureEndTime - captureStartTime,
+                        decodeEndTime - decodeStartTime,
+                        cropResizeEndTime - decodeEndTime,
+                        inferenceEndTime - cropResizeEndTime,
+                        inferenceEndTime - triggerStartTime,
+                        esp32Result.c_str());
+        
+        // Make flap decision
+        if (esp32PreyDetected) {
+          handleFlapStateCommand("OFF");
+        } else {
+          handleFlapStateCommand("ON");
+        }
+        
+        heap_caps_free(inference_buf);
+      } else {
+        mqttDebugPrintln("Failed to allocate inference buffer");
+      }
+    } else {
+      mqttDebugPrintf("JPEG decode failed or unexpected size: %dx%d (expected %dx%d)\n", 
+                      decoded_w, decoded_h, DECODE_WIDTH, DECODE_HEIGHT);
+    }
   }
-  heap_caps_free(cropped); // struct was in PSRAM
 
   esp_camera_fb_return(fb);
 }
@@ -1854,26 +2070,41 @@ void handleInferenceTopic(String inferenceStr) {
 }
 
 void handleServerInference(String serverInferenceStr) {
+  unsigned long serverResponseTime = millis();
+  
   // Server sends simplified result: "prey" or "not_prey"
   lastServerInference = serverInferenceStr;
   totalInferences++;
   
-  // Compare ESP32 and Server results
-  if (lastESP32Inference == lastServerInference) {
-    inferenceMatches++;
-    mqttDebugPrintf("Inference match: %s\n", lastESP32Inference.c_str());
-  } else {
-    inferenceMismatches++;
-    mqttDebugPrintf("Inference mismatch! ESP32: %s, Server: %s\n", 
-                    lastESP32Inference.c_str(), lastServerInference.c_str());
-  }
+  // Print SERVER full round-trip timing
+  unsigned long serverInferenceLatency = serverResponseTime - sendEndTime;
+  unsigned long serverTotalMs = serverResponseTime - triggerStartTime;
+  mqttDebugPrintf("[TIMER SERVER COMPLETE] barrier_to_capture=%lu, capture=%lu, send=%lu, server_inference=%lu, total=%lu ms | result=%s\n",
+                  captureStartTime - triggerStartTime,
+                  captureEndTime - captureStartTime,
+                  sendEndTime - captureEndTime,
+                  serverInferenceLatency,
+                  serverTotalMs,
+                  serverInferenceStr.c_str());
   
-  // Publish comparison stats
-  float accuracy = totalInferences > 0 ? (float)inferenceMatches / totalInferences * 100.0 : 0.0;
-  String comparisonMsg = String("Matches: ") + inferenceMatches + 
-                        " / " + totalInferences + 
-                        " (" + String(accuracy, 1) + "%)";
-  client.publish(INFERENCE_COMPARISON_TOPIC, comparisonMsg.c_str(), true);
+  // Compare ESP32 and Server results (only if both modes active)
+  if (inferenceMode == INFERENCE_MODE_BOTH && lastESP32Inference.length() > 0) {
+    if (lastESP32Inference == lastServerInference) {
+      inferenceMatches++;
+      mqttDebugPrintf("Inference MATCH: %s\n", lastESP32Inference.c_str());
+    } else {
+      inferenceMismatches++;
+      mqttDebugPrintf("Inference MISMATCH! ESP32=%s, Server=%s\n", 
+                      lastESP32Inference.c_str(), lastServerInference.c_str());
+    }
+    
+    // Publish comparison stats
+    float accuracy = totalInferences > 0 ? (float)inferenceMatches / totalInferences * 100.0 : 0.0;
+    String comparisonMsg = String("Matches: ") + inferenceMatches + 
+                          " / " + totalInferences + 
+                          " (" + String(accuracy, 1) + "%)";
+    client.publish(INFERENCE_COMPARISON_TOPIC, comparisonMsg.c_str(), true);
+  }
 }
 
 void handleDetectionModeCommand(String stateStr) {
@@ -2638,6 +2869,10 @@ void loadSettingsFromEEPROM() {
     } else {
         mqttDebugPrintln("Failed to get camera sensor. Cannot load camera settings from EEPROM.");
     }
+
+    // Apply the active camera preset (day/night)
+    applyPresetFromEEPROM(activeCameraPreset);
+    mqttDebugPrintf("Applied camera preset: %s\n", activeCameraPreset == 0 ? "day" : "night");
 }
 
 // Helper: save current sensor settings into a preset slot
