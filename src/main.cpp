@@ -13,6 +13,7 @@
 #include "esp_heap_caps.h"
 #include "img_converters.h" // For JPEG decoding
 #include "esp_jpg_decode.h" // For JPG_SCALE_4X
+#include <ESP32_JPEG_Library.h>
 //#include <ArduTFLite.h>
 #include <SD_MMC.h>
 #include <SPI.h>
@@ -293,8 +294,9 @@ static uint32_t g_pulseQualitySamples = 0;
 
 // The Tensor Arena memory area is used by TensorFlow Lite to store input, output and intermediate tensors
 // Try internal RAM first (much faster), fall back to PSRAM if needed.
-constexpr int kTensorArenaSizeInternal = 200 * 1024;  // 200KB - try internal RAM
-constexpr int kTensorArenaSizePSRAM = 600 * 1024;     // 600KB - fallback to PSRAM
+// Keep internal target modest to improve allocation success; arena usage is ~48 KB with the slim model
+constexpr int kTensorArenaSizeInternal = 64 * 1024;   // Prefer a small block to leave headroom for servers
+constexpr int kTensorArenaSizePSRAM = 600 * 1024;     // Fallback size in PSRAM if internal fails
 int kTensorArenaSize = 0;  // Actual allocated size
 uint8_t* tensor_arena = nullptr;
 bool tensor_arena_in_psram = false;
@@ -344,14 +346,29 @@ static bool adoptFileModel(const char* path)
 void setup() {
   Serial.begin(115200);
   delay(1000);  // Wait for Serial
-  
-  // Try internal RAM first (10x faster for inference)
+
+  // Try internal RAM first (faster). Use modest target size and log largest free block.
   tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSizeInternal, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (tensor_arena) {
     kTensorArenaSize = kTensorArenaSizeInternal;
     tensor_arena_in_psram = false;
     Serial.printf("Tensor arena in INTERNAL RAM: %d KB\n", kTensorArenaSize / 1024);
   } else {
+    size_t largestInternal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    Serial.printf("Internal RAM arena alloc failed. Largest free internal block: %u bytes\n", (unsigned)largestInternal);
+    // Try a right-sized internal arena if there is a reasonably large contiguous block
+    size_t retryInternalSize = (largestInternal > (12 * 1024)) ? (largestInternal - 12 * 1024) : 0; // keep headroom
+    if (retryInternalSize >= 64 * 1024) {
+      tensor_arena = (uint8_t*)heap_caps_malloc(retryInternalSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      if (tensor_arena) {
+        kTensorArenaSize = retryInternalSize;
+        tensor_arena_in_psram = false;
+        Serial.printf("Tensor arena in INTERNAL RAM (downsized): %d KB\n", kTensorArenaSize / 1024);
+      }
+    }
+  }
+
+  if (!tensor_arena) {
     // Fall back to PSRAM
     tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSizePSRAM, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (tensor_arena) {
@@ -362,9 +379,14 @@ void setup() {
       Serial.println("Failed to allocate tensor arena!");
     }
   }
+
+  Serial.printf("Heap after arena alloc: total=%u, internal=%u, psram=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
   bool sdFailed = false;
   bool modelFailed = false;
-  // Initialize SD card and load model from SD
+  
   // Initialize SD card and load model from SD
   if (!SD_MMC.begin("/sdcard", true)) {
     g_model_loaded = false;
@@ -624,8 +646,8 @@ void initializeEEPROM() {
   // Initialize camera settings to defaults
   sensor_t * s = esp_camera_sensor_get();
   if (s != NULL) {
-    s->set_framesize(s, FRAMESIZE_VGA);
-    s->set_quality(s, 10);
+    s->set_framesize(s, FRAMESIZE_QVGA);
+    s->set_quality(s, 20);
     s->set_brightness(s, -2);
     s->set_contrast(s, 1);
     s->set_whitebal(s, true);
@@ -639,8 +661,8 @@ void initializeEEPROM() {
   savePresetToEEPROM(0); // day
 
   if (s != NULL) {
-    s->set_framesize(s, FRAMESIZE_VGA);
-    s->set_quality(s, 10);
+    s->set_framesize(s, FRAMESIZE_QVGA);
+    s->set_quality(s, 20);
     s->set_brightness(s, -2);
     s->set_contrast(s, 1);
     s->set_whitebal(s, false);
@@ -800,9 +822,9 @@ esp_err_t initCamera() {
   config.pixel_format = PIXFORMAT_JPEG;  // Use JPEG format
   config.fb_location = CAMERA_FB_IN_PSRAM;
 
-  // Frame parameters
-  config.frame_size   = FRAMESIZE_VGA;
-  config.jpeg_quality = 10; // Lower means higher quality
+  // Frame parameters (QVGA for faster decode)
+  config.frame_size   = FRAMESIZE_QVGA;
+  config.jpeg_quality = 10; // higher number = lower size, faster decode
   config.fb_count     = 1;
   config.grab_mode    = CAMERA_GRAB_LATEST;
 
@@ -996,12 +1018,14 @@ bool run_inference(uint8_t* input_data, size_t input_data_size) {
 // Once working, we can optimize buffer sizes
 static uint8_t* g_rgb_buf = nullptr;      // RGB888 buffer for VGA (640*480*3 = 921600 bytes)
 static uint8_t* g_decoded_gray_buf = nullptr;  // Grayscale buffer (640*480 = 307200 bytes)
-static const int DECODE_WIDTH = 640;   // Full VGA width
-static const int DECODE_HEIGHT = 480;  // Full VGA height
-static const int SENSOR_WIDTH = 640;
-static const int SENSOR_HEIGHT = 480;
-static const size_t DECODE_RGB_SIZE = DECODE_WIDTH * DECODE_HEIGHT * 3;
-static const size_t DECODE_GRAY_SIZE = DECODE_WIDTH * DECODE_HEIGHT;
+static uint8_t* g_rgb_buf_espjpeg = nullptr;   // Aligned RGB buffer for ESP32_JPEG decoder
+static uint8_t* g_rgb_buf_espjpeg_base = nullptr; // Base pointer for aligned alloc
+static const int DECODE_WIDTH = 320;   // QVGA width to speed decode
+static const int DECODE_HEIGHT = 240;  // QVGA height
+static const int SENSOR_WIDTH = 320;
+static const int SENSOR_HEIGHT = 240;
+static const size_t DECODE_RGB_SIZE = DECODE_WIDTH * DECODE_HEIGHT * 3;   // 230400 bytes
+static const size_t DECODE_GRAY_SIZE = DECODE_WIDTH * DECODE_HEIGHT;      // 76800 bytes
 
 // Context for esp_jpg_decode callbacks
 typedef struct {
@@ -1149,6 +1173,115 @@ uint8_t* jpegToGrayscale(const uint8_t* jpg_buf, size_t jpg_len, int* out_width,
   return g_decoded_gray_buf;
 }
 
+// Decode using ESP32_JPEG library (aligned, typically faster)
+uint8_t* jpegToGrayscaleEsp32Jpeg(const uint8_t* jpg_buf, size_t jpg_len, int* out_width, int* out_height) {
+  // Allocate aligned RGB buffer if needed (manual align to 16 bytes)
+  if (!g_rgb_buf_espjpeg) {
+    size_t alloc_size = DECODE_RGB_SIZE + 16; // extra for alignment
+    g_rgb_buf_espjpeg_base = (uint8_t*)heap_caps_malloc(alloc_size, MALLOC_CAP_SPIRAM);
+    if (!g_rgb_buf_espjpeg_base) {
+      mqttDebugPrintln("ESP32_JPEG: Failed to allocate RGB base buffer");
+      return nullptr;
+    }
+    uintptr_t addr = (uintptr_t)g_rgb_buf_espjpeg_base;
+    uintptr_t aligned = (addr + 15) & ~((uintptr_t)0x0F);
+    g_rgb_buf_espjpeg = (uint8_t*)aligned;
+    mqttDebugPrintf("ESP32_JPEG: Allocated aligned RGB buffer: %d bytes (base=%p aligned=%p)\n", DECODE_RGB_SIZE, g_rgb_buf_espjpeg_base, g_rgb_buf_espjpeg);
+  }
+
+  // Allocate grayscale buffer if needed
+  if (!g_decoded_gray_buf) {
+    g_decoded_gray_buf = (uint8_t*)heap_caps_malloc(DECODE_GRAY_SIZE, MALLOC_CAP_SPIRAM);
+    if (!g_decoded_gray_buf) {
+      mqttDebugPrintln("ESP32_JPEG: Failed to allocate grayscale buffer");
+      return nullptr;
+    }
+    mqttDebugPrintf("ESP32_JPEG: Allocated grayscale buffer: %d bytes\n", DECODE_GRAY_SIZE);
+  }
+
+  mqttDebugPrintf("ESP32_JPEG: decode start, jpg_len=%d\n", (int)jpg_len);
+
+  // Configure decoder
+  jpeg_dec_config_t config = {
+    .output_type = JPEG_RAW_TYPE_RGB888,
+    .rotate = JPEG_ROTATE_0D,
+  };
+
+  jpeg_dec_handle_t *dec = jpeg_dec_open(&config);
+  if (!dec) {
+    mqttDebugPrintln("ESP32_JPEG: jpeg_dec_open failed");
+    return nullptr;
+  }
+
+  jpeg_dec_io_t *io = (jpeg_dec_io_t*)calloc(1, sizeof(jpeg_dec_io_t));
+  jpeg_dec_header_info_t *info = (jpeg_dec_header_info_t*)calloc(1, sizeof(jpeg_dec_header_info_t));
+  if (!io || !info) {
+    mqttDebugPrintln("ESP32_JPEG: alloc io/header failed");
+    if (io) free(io);
+    if (info) free(info);
+    jpeg_dec_close(dec);
+    return nullptr;
+  }
+
+  io->inbuf = (unsigned char*)jpg_buf;
+  io->inbuf_len = jpg_len;
+
+  jpeg_error_t ret = jpeg_dec_parse_header(dec, io, info);
+  if (ret != JPEG_ERR_OK) {
+    mqttDebugPrintf("ESP32_JPEG: parse header failed %d\n", (int)ret);
+    free(io);
+    free(info);
+    jpeg_dec_close(dec);
+    return nullptr;
+  }
+
+  int expected_len = info->width * info->height * 3;
+  if (expected_len > (int)DECODE_RGB_SIZE) {
+    mqttDebugPrintf("ESP32_JPEG: output too large %dx%d (bytes=%d)\n", info->width, info->height, expected_len);
+    free(io);
+    free(info);
+    jpeg_dec_close(dec);
+    return nullptr;
+  }
+
+  io->outbuf = g_rgb_buf_espjpeg;
+  int consumed = io->inbuf_len - io->inbuf_remain;
+  io->inbuf = (unsigned char*)jpg_buf + consumed;
+  io->inbuf_len = io->inbuf_remain;
+
+  ret = jpeg_dec_process(dec, io);
+  if (ret != JPEG_ERR_OK) {
+    mqttDebugPrintf("ESP32_JPEG: decode failed %d\n", (int)ret);
+    free(io);
+    free(info);
+    jpeg_dec_close(dec);
+    return nullptr;
+  }
+
+  *out_width = info->width;
+  *out_height = info->height;
+
+  int gray_pixels = info->width * info->height;
+  if (gray_pixels > (int)DECODE_GRAY_SIZE) {
+    mqttDebugPrintf("ESP32_JPEG: gray buffer too small %d px\n", gray_pixels);
+    free(io);
+    free(info);
+    jpeg_dec_close(dec);
+    return nullptr;
+  }
+
+  for (int i = 0; i < gray_pixels; i++) {
+    g_decoded_gray_buf[i] = g_rgb_buf_espjpeg[i * 3];
+  }
+
+  mqttDebugPrintf("ESP32_JPEG: decode OK, w=%d h=%d\n", *out_width, *out_height);
+
+  free(io);
+  free(info);
+  jpeg_dec_close(dec);
+  return g_decoded_gray_buf;
+}
+
 // Fallback decode using esp32-camera's fmt2rgb888 (internal JPEG decoder)
 uint8_t* jpegToGrayscaleFallback(const uint8_t* jpg_buf, size_t jpg_len, int* out_width, int* out_height) {
   // Allocate RGB buffer if needed (full VGA size to be safe)
@@ -1236,13 +1369,17 @@ void captureAndSendImage() {
     Serial.printf("LOCAL: starting decode, fb->len=%d\n", fb->len);
     decodeStartTime = millis();
     
-    // Decode JPEG to grayscale (full VGA 640x480)
+    // Decode JPEG to grayscale (QVGA 320x240)
     int decoded_w = 0, decoded_h = 0;
     size_t heap_before = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     size_t heap_min_before = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
     mqttDebugPrintf("heap before decode: %u free / %u min\n", (unsigned)heap_before, (unsigned)heap_min_before);
-    // Use fallback decoder directly to avoid esp_jpg_decode hang
-    uint8_t *gray_buf = jpegToGrayscaleFallback(fb->buf, fb->len, &decoded_w, &decoded_h);
+    // Try fast ESP32_JPEG decoder first, fallback to fmt2rgb888 if needed
+    uint8_t *gray_buf = jpegToGrayscaleEsp32Jpeg(fb->buf, fb->len, &decoded_w, &decoded_h);
+    if (!gray_buf || decoded_w != DECODE_WIDTH || decoded_h != DECODE_HEIGHT) {
+      mqttDebugPrintln("Primary ESP32_JPEG decode failed or size mismatch, trying fmt2rgb888 fallback");
+      gray_buf = jpegToGrayscaleFallback(fb->buf, fb->len, &decoded_w, &decoded_h);
+    }
     size_t heap_after = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     size_t heap_min_after = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
     mqttDebugPrintf("heap after decode: %u free / %u min\n", (unsigned)heap_after, (unsigned)heap_min_after);
@@ -1251,20 +1388,20 @@ void captureAndSendImage() {
     Serial.printf("LOCAL: decode done, gray_buf=%p, w=%d, h=%d\n", gray_buf, decoded_w, decoded_h);
     
     if (gray_buf && decoded_w == DECODE_WIDTH && decoded_h == DECODE_HEIGHT) {
-      // Crop centered 384x384 from VGA (640x480), then resize to 96x96
-      const int cropSize = 384;
+      // Crop centered 192x192 from QVGA (320x240), then resize to 96x96
+      const int cropSize = 192;
       const int targetSize = 96;
-      int left = (decoded_w - cropSize) / 2;  // (640-384)/2 = 128
-      int top = (decoded_h - cropSize) / 2;   // (480-384)/2 = 48
+      int left = (decoded_w - cropSize) / 2;  // (320-192)/2 = 64
+      int top = (decoded_h - cropSize) / 2;   // (240-192)/2 = 24
       
       // Allocate inference buffer
       uint8_t *inference_buf = (uint8_t*)heap_caps_malloc(targetSize * targetSize, MALLOC_CAP_SPIRAM);
       if (inference_buf) {
-        // Resize 384x384 to 96x96 using nearest neighbor (4x downscale)
+        // Resize 192x192 to 96x96 using nearest neighbor (2x downscale)
         for (int y = 0; y < targetSize; y++) {
-          int srcY = top + y * 4;  // Scale factor 4
+          int srcY = top + y * 2;  // Scale factor 2
           for (int x = 0; x < targetSize; x++) {
-            int srcX = left + x * 4;
+            int srcX = left + x * 2;
             inference_buf[y * targetSize + x] = gray_buf[srcY * decoded_w + srcX];
           }
         }
@@ -1674,7 +1811,7 @@ void publishDiscoveryConfigs() {
   //jpegQualityConfig["entity_category"] = "configuration";
   jpegQualityConfig["state_topic"] = "catflap/jpeg_quality";
   jpegQualityConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_jpeg_quality";
-  jpegQualityConfig["min"] = 10;
+  jpegQualityConfig["min"] = 0;
   jpegQualityConfig["max"] = 63;
   jpegQualityConfig["step"] = 1;
   JsonObject deviceInfoJpegQuality = jpegQualityConfig.createNestedObject("device");
@@ -2138,7 +2275,7 @@ void handleCatLocationCommand(String locationStr) {
 
 void handleJpegQualityCommand(String qualityStr) {
   int quality = qualityStr.toInt();
-  if (quality < 10 || quality > 63) {
+  if (quality < 0 || quality > 63) {
     mqttDebugPrintln("Invalid JPEG quality value");
     return;
   }
