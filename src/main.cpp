@@ -153,6 +153,12 @@ const char* password = WIFI_PASSWORD;
 #define PCLK_GPIO_NUM    22
 
 
+struct ModelMetadata {
+	String modelName;
+	uint8_t numberOfLabels;
+	float threshold;
+};
+
 // Forward declarations of functions
 void IRAM_ATTR ir_falling_isr();
 void checkResetReason();
@@ -172,13 +178,13 @@ void mqttInitialPublish();
 esp_err_t initCamera();
 void captureAndSendImage();
 uint8_t* jpegToGrayscale(const uint8_t* jpg_buf, size_t jpg_len, int* out_width, int* out_height);
-
 camera_fb_t* cropImage(camera_fb_t *fb);
 camera_fb_t* resizeImage(camera_fb_t *cropped, int originalSize, int targetSize);
 camera_fb_t* cropFrame(camera_fb_t *fb);
 camera_fb_t* resizeFrame(camera_fb_t *cropped);
 bool setupInference();
 bool loadModelFromSD(const char* path, uint8_t** model_data, size_t* model_size);
+bool loadModelMetadata(const char *path, ModelMetadata &meta);
 void enableFlap();
 void disableFlap();
 void handleMqttMessages(char* topic, byte* payload, unsigned int length);
@@ -226,7 +232,8 @@ void savePresetToEEPROM(uint8_t presetIndex);
 void applyPresetFromEEPROM(uint8_t presetIndex);
 void handleInferenceModeCommand(String modeStr);
 bool saveGrayscaleToSD(uint8_t* buf, int width, int height, const char* filename);
-String generateInferenceFilename(const String& result);
+uint32_t fnv1a_32(const uint8_t* data, size_t len);
+String makeImageName(const uint8_t* data, size_t len);
 // Add more handler functions as needed
 
 WiFiClient espClient;
@@ -312,6 +319,7 @@ const uint8_t* g_model_data = nullptr;
 size_t g_model_size = 0;
 // If non-null, this holds a heap/PSRAM-allocated model we own and must free on reload.
 static uint8_t* g_owned_heap_model = nullptr;
+static ModelMetadata currentModelMeta;
 
 // -------- Model ownership helpers (SD-only model) --------
 static void freeOwnedModel()
@@ -410,6 +418,7 @@ void setup() {
       g_model_loaded = false;
     } else {
       mqttDebugPrintln("Using SD card model");
+      loadModelMetadata("/models/model_metadata.json", currentModelMeta);
       g_model_loaded = true;
     }
   }
@@ -844,6 +853,33 @@ esp_err_t initCamera() {
   return err;
 }
 
+bool loadModelMetadata(const char *path, ModelMetadata &meta)
+{
+	File file = SD_MMC.open(path, FILE_READ);
+	if (!file) {
+		Serial.print("Failed to open metadata file: ");
+		Serial.println(path);
+		return false;
+	}
+
+	StaticJsonDocument<256> doc;  // plenty for this tiny JSON
+
+	DeserializationError err = deserializeJson(doc, file);
+	file.close();
+
+	if (err) {
+		Serial.print("Failed to parse metadata JSON: ");
+		Serial.println(err.c_str());
+		return false;
+	}
+
+	meta.modelName       = doc["model_name"]       | String("unknown_model");
+	meta.numberOfLabels  = doc["number_of_labels"] | 0;
+	meta.threshold       = doc["threshold_value"]  | 0.5f;
+
+	return true;
+}
+
 // Function to load the model file from the SD card into memory.
 bool loadModelFromSD(const char* modelPath, uint8_t** modelBuffer, size_t* modelSize) {
   File modelFile = SD_MMC.open(modelPath, FILE_READ);
@@ -904,20 +940,22 @@ bool updateModelFromSD() {
   return false;
 }
 
-void reloadModel() {
+bool reloadModel() {
   // Reload from SD and reinitialize interpreter
   g_model_loaded = false;
   if (!adoptFileModel("/model.tflite")) {
     mqttDebugPrintf("Failed to load the new model from SD");
-    return;
+    return false;
   }
   g_model_loaded = true;
   if (!setupInference()) {
     g_model_loaded = false;
     mqttDebugPrintf("Failed to reinitialize inference with the new model");
+    return false;
   } else {
     mqttDebugPrintln("New model loaded and interpreter reinitialized.");
   }
+  return true;
 }
 
 // Setup function to initialize the model and interpreter.
@@ -974,21 +1012,21 @@ bool setupInference() {
 
 // Run inference using the persistent interpreter.
 // 'input_data' must match the model's expected input size.
-bool run_inference(uint8_t* input_data, size_t input_data_size) {
+TfLiteTensor* run_inference(uint8_t* input_data, size_t input_data_size) {
   if (!g_model_loaded || interpreter == nullptr) {
     mqttDebugPrintln("run_inference: Model not loaded or interpreter not initialized.");
-    return false;
+    return nullptr;
   }
   // Get the model's input tensor.
   TfLiteTensor* input = interpreter->input(0);
   if (input == nullptr) {
     mqttDebugPrintln("run_inference: input tensor is nullptr.");
-    return false;
+    return nullptr;
   }
   if (input_data_size != input->bytes) {
     mqttDebugPrintf("Input data size (%d) does not match model input size (%d)\n",
                   input_data_size, input->bytes);
-    return false;  // or handle the error as needed
+    return nullptr;  // or handle the error as needed
   }
   // Copy the input data into the input tensor.
   memcpy(input->data.uint8, input_data, input_data_size);
@@ -996,21 +1034,22 @@ bool run_inference(uint8_t* input_data, size_t input_data_size) {
   TfLiteStatus invoke_status = interpreter->Invoke();
   if (invoke_status != kTfLiteOk) {
     mqttDebugPrintf("Invoke failed");
-    return false;
+    return nullptr;
   }
   // Get the output tensor.
   TfLiteTensor* output = interpreter->output(0);
   if (output == nullptr) {
     mqttDebugPrintln("run_inference: output tensor is nullptr.");
-    return false;
+    return nullptr;
   }
   // For a two-element output:
   // output->data.uint8[0] is the score for "prey"
   // output->data.uint8[1] is the score for "not_prey"
   // output->data.uint8[2] is the score for "not_cat" if used
+  
   bool preyDetected = output->data.uint8[0] > output->data.uint8[1];
   
-  return preyDetected;
+  return output;
 }
 
 // -------- JPEG Decode Infrastructure --------
@@ -1374,6 +1413,7 @@ void captureAndSendImage() {
     size_t heap_before = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     size_t heap_min_before = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
     mqttDebugPrintf("heap before decode: %u free / %u min\n", (unsigned)heap_before, (unsigned)heap_min_before);
+
     // Try fast ESP32_JPEG decoder first, fallback to fmt2rgb888 if needed
     uint8_t *gray_buf = jpegToGrayscaleEsp32Jpeg(fb->buf, fb->len, &decoded_w, &decoded_h);
     if (!gray_buf || decoded_w != DECODE_WIDTH || decoded_h != DECODE_HEIGHT) {
@@ -1382,10 +1422,9 @@ void captureAndSendImage() {
     }
     size_t heap_after = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     size_t heap_min_after = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
-    mqttDebugPrintf("heap after decode: %u free / %u min\n", (unsigned)heap_after, (unsigned)heap_min_after);
+    
     decodeEndTime = millis();
     mqttDebugPrintf("LOCAL: decode done, gray_buf=%p, w=%d, h=%d\n", gray_buf, decoded_w, decoded_h);
-    Serial.printf("LOCAL: decode done, gray_buf=%p, w=%d, h=%d\n", gray_buf, decoded_w, decoded_h);
     
     if (gray_buf && decoded_w == DECODE_WIDTH && decoded_h == DECODE_HEIGHT) {
       // Crop centered 192x192 from QVGA (320x240), then resize to 96x96
@@ -1408,13 +1447,39 @@ void captureAndSendImage() {
         cropResizeEndTime = millis();
         
         // Run inference on 96x96 grayscale
-        bool esp32PreyDetected = run_inference(inference_buf, targetSize * targetSize);
+        TfLiteTensor* inference_result = run_inference(inference_buf, targetSize * targetSize);
+        bool esp32PreyDetected = false;
+        String esp32Result = "";
+        
+        // assumes inference_result->data.uint8 has N scores
+        auto *scores = inference_result->data.uint8;
+        int num_scores = inference_result->dims->data[inference_result->dims->size - 1]; // typically 3
+        int max_inference_index = static_cast<int>(std::distance(scores,
+            std::max_element(scores, scores + num_scores)));
+
+        // max score if you need it:
+        uint8_t max_score = scores[max_inference_index];
+
+        switch (max_inference_index) {
+          case 0: esp32Result = "prey"; break;
+          case 1: esp32Result = "not_prey"; break;
+          case 2: esp32Result = "not_cat"; break;
+        }
+
         inferenceEndTime = millis();
         
         // Publish result
-        String esp32Result = esp32PreyDetected ? "prey" : "not_prey";
+        static String imgName = makeImageName((uint8_t*)fb->buf, fb->len);
         lastESP32Inference = esp32Result;
-        client.publish(ESP32_INFERENCE_TOPIC, esp32Result.c_str(), false);
+        StaticJsonDocument<256> doc;
+        doc["hash"] = imgName;
+        doc["label"] = esp32Result;
+        doc["confidence"] = max_score / 255.0f; // float
+        doc["model"] = currentModelMeta.modelName; // const char*
+
+        String payload;
+        serializeJson(doc, payload);
+        client.publish(ESP32_INFERENCE_TOPIC, payload.c_str(), false);
         
         // Print LOCAL timing summary
         mqttDebugPrintf("[TIMER LOCAL] barrier_to_capture=%lu, capture=%lu, decode=%lu, crop=%lu, inference=%lu, total=%lu ms | result=%s\n",
@@ -1546,23 +1611,6 @@ bool saveGrayscaleToSD(uint8_t* buf, int width, int height, const char* filename
   file.close();
   
   return true;
-}
-
-// Generate unique filename for inference image based on timestamp
-String generateInferenceFilename(const String& result) {
-  static unsigned long imageCounter = 0;
-  imageCounter++;
-  
-  // Format: /inference/HHMMSS_result_counter.pgm
-  unsigned long uptime = millis() / 1000;
-  int hours = (uptime / 3600) % 24;
-  int mins = (uptime / 60) % 60;
-  int secs = uptime % 60;
-  
-  char filename[64];
-  snprintf(filename, sizeof(filename), "/inference/%02d%02d%02d_%s_%04lu.pgm", 
-           hours, mins, secs, result.c_str(), imageCounter);
-  return String(filename);
 }
 
 void enableFlap() {
@@ -2659,7 +2707,7 @@ void setupOTA() {
 
 void setupWebServer() {
   // Model upload endpoint
-  server.on("/upload", HTTP_POST, 
+  server.on("/upload_model", HTTP_POST, 
     [](AsyncWebServerRequest *request) {
       // Response is sent in onUpload handler
     },
@@ -2736,16 +2784,138 @@ void setupWebServer() {
         }
         SD_MMC.rename(tempPath, "/model.tflite");
         
+        // Reload the model from SD
+        if (!reloadModel()) {
+          mqttDebugPrintln("Failed to load the new model after upload");
+          request->send(500, "text/plain", "Model uploaded but failed to load");
+          return;
+        }
+
         mqttDebugPrintln("New model installed successfully!");
         client.publish(DEBUG_TOPIC, "New model uploaded and validated", false);
-        
-        // Reload the model from SD
-        reloadModel();
         
         request->send(200, "text/plain", "Model uploaded successfully");
       }
     }
   );
+
+  server.on("/upload_metadata", HTTP_POST,
+	[](AsyncWebServerRequest *request) {
+		// Response is sent in onUpload handler
+	},
+	[](AsyncWebServerRequest *request, String filename, size_t index,
+	   uint8_t *data, size_t len, bool final) {
+		static File uploadFile;
+		static String tempPath = "/model_meta_temp.json";
+		static size_t totalSize = 0;
+
+		if (index == 0) {
+			// Start of upload
+			mqttDebugPrintln("Starting metadata upload...");
+			totalSize = 0;
+
+			if (!g_sd_ready) {
+				mqttDebugPrintln("SD card not available for metadata upload");
+				request->send(500, "text/plain", "SD card not available");
+				return;
+			}
+
+			// Open temp file for writing
+			uploadFile = SD_MMC.open(tempPath, FILE_WRITE);
+			if (!uploadFile) {
+				mqttDebugPrintln("Failed to create temp metadata file");
+				request->send(500, "text/plain", "Failed to create temp metadata file");
+				return;
+			}
+		}
+
+		// Write chunk
+		if (uploadFile) {
+			uploadFile.write(data, len);
+			totalSize += len;
+		}
+
+		if (final) {
+			// End of upload
+			uploadFile.close();
+			mqttDebugPrintf("Metadata upload complete: %d bytes\n", totalSize);
+
+			// Basic size sanity check (avoid huge/empty files)
+			if (totalSize < 10 || totalSize > 4096) {
+				mqttDebugPrintf("Invalid metadata size: %d bytes\n", totalSize);
+				SD_MMC.remove(tempPath);
+				request->send(400, "text/plain", "Invalid metadata size");
+				return;
+			}
+
+			// Validate JSON structure
+			File metaFile = SD_MMC.open(tempPath, FILE_READ);
+			if (!metaFile) {
+				mqttDebugPrintln("Failed to open uploaded metadata for validation");
+				SD_MMC.remove(tempPath);
+				request->send(500, "text/plain", "Upload failed - validation error");
+				return;
+			}
+
+			StaticJsonDocument<256> doc;
+			DeserializationError err = deserializeJson(doc, metaFile);
+			metaFile.close();
+
+			if (err) {
+				mqttDebugPrint("Failed to parse metadata JSON: ");
+				mqttDebugPrintln(err.c_str());
+				SD_MMC.remove(tempPath);
+				request->send(400, "text/plain", "Invalid JSON in metadata file");
+				return;
+			}
+
+			// Check required fields and types
+			if (!doc.containsKey("model_name") ||
+				!doc.containsKey("number_of_labels") ||
+				!doc.containsKey("threshold_value")) {
+				mqttDebugPrintln("Metadata JSON missing required fields");
+				SD_MMC.remove(tempPath);
+				request->send(400, "text/plain",
+				              "Missing fields (model_name, number_of_labels, threshold_value)");
+				return;
+			}
+
+			// (Optional) light type sanity checks
+			if (!doc["model_name"].is<const char*>() ||
+			    !doc["number_of_labels"].is<int>() ||
+			    (!doc["threshold_value"].is<float>() &&
+			     !doc["threshold_value"].is<double>())) {
+				mqttDebugPrintln("Metadata JSON fields have wrong types");
+				SD_MMC.remove(tempPath);
+				request->send(400, "text/plain", "Wrong field types in metadata JSON");
+				return;
+			}
+
+			// Metadata is valid, replace the old one
+			if (SD_MMC.exists("/model_meta.json")) {
+				SD_MMC.remove("/model_meta.json");
+			}
+			SD_MMC.rename(tempPath, "/model_meta.json");
+
+			// Reload metadata into RAM
+			if (loadModelMetadata("/model_meta.json", currentModelMeta)) {
+				mqttDebugPrintln("New metadata installed and loaded successfully!");
+				mqttDebugPrintf("Model: %s, labels: %d, threshold: %.3f\n",
+				                currentModelMeta.modelName.c_str(),
+				                currentModelMeta.numberOfLabels,
+				                currentModelMeta.threshold);
+				client.publish(DEBUG_TOPIC,
+				               "New model metadata uploaded and validated", false);
+				request->send(200, "text/plain", "Metadata uploaded successfully");
+			} else {
+				mqttDebugPrintln("Metadata file stored but failed to load");
+				request->send(500, "text/plain",
+				              "Metadata stored but failed to load (see logs)");
+			}
+		}
+	}
+);
+
   
   // Simple health check endpoint
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -3188,4 +3358,25 @@ void handleInferenceModeCommand(String modeStr) {
   // Publish state
   client.publish(INFERENCE_MODE_TOPIC, modeStr.c_str(), true);
   mqttDebugPrintf("Inference mode set to: %s\n", modeStr.c_str());
+}
+
+uint32_t fnv1a_32(const uint8_t* data, size_t len)
+{
+    const uint32_t FNV_OFFSET_BASIS = 2166136261u;
+    const uint32_t FNV_PRIME        = 16777619u;
+
+    uint32_t hash = FNV_OFFSET_BASIS;
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= data[i];
+        hash *= FNV_PRIME;
+    }
+    return hash;
+}
+
+String makeImageName(const uint8_t* data, size_t len)
+{
+    uint32_t h = fnv1a_32(data, len);
+    char buf[11]; // "img_" + 8 hex + '\0' = 12 actually, be safe:
+    snprintf(buf, sizeof(buf), "%08X", h);   // e.g. "3FA12C7E"
+    return String(buf);
 }
