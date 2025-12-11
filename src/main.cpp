@@ -1469,7 +1469,7 @@ void captureAndSendImage() {
         inferenceEndTime = millis();
         
         // Publish result
-        static String imgName = makeImageName((uint8_t*)fb->buf, fb->len);
+        String imgName = makeImageName((uint8_t*)fb->buf, fb->len);
         lastESP32Inference = esp32Result;
         StaticJsonDocument<256> doc;
         doc["hash"] = imgName;
@@ -2256,9 +2256,23 @@ void handleInferenceTopic(String inferenceStr) {
 
 void handleServerInference(String serverInferenceStr) {
   unsigned long serverResponseTime = millis();
-  
-  // Server sends simplified result: "prey" or "not_prey"
-  lastServerInference = serverInferenceStr;
+
+  // Server now sends JSON: {"hash","label","confidence","model"}
+  String parsedLabel = serverInferenceStr;
+  DynamicJsonDocument doc(256);
+  DeserializationError err = deserializeJson(doc, serverInferenceStr);
+  if (!err) {
+    parsedLabel = doc["label"] | parsedLabel;
+    // Optional: capture hash/confidence/model for future use/debug
+    String srvHash = doc["hash"] | "";
+    double srvConf = doc["confidence"] | -1.0;
+    String srvModel = doc["model"] | "";
+  } else {
+    mqttDebugPrintf("Server inference parse failed: %s\n", err.c_str());
+  }
+
+  // Use parsed label for comparisons/state
+  lastServerInference = parsedLabel;
   totalInferences++;
   
   // Print SERVER full round-trip timing
@@ -2270,7 +2284,7 @@ void handleServerInference(String serverInferenceStr) {
                   sendEndTime - captureEndTime,
                   serverInferenceLatency,
                   serverTotalMs,
-                  serverInferenceStr.c_str());
+                  parsedLabel.c_str());
   
   // Compare ESP32 and Server results (only if both modes active)
   if (inferenceMode == INFERENCE_MODE_BOTH && lastESP32Inference.length() > 0) {
