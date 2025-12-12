@@ -349,6 +349,16 @@ static bool adoptFileModel(const char* path)
   g_model_size = sz;
   return true;
 }
+
+// Try primary metadata path, then legacy path if present.
+static bool loadActiveModelMetadata()
+{
+  if (loadModelMetadata("/model_meta.json", currentModelMeta)) {
+    return true;
+  }
+  // Legacy location used by older builds
+  return loadModelMetadata("/models/model_metadata.json", currentModelMeta);
+}
 // -------------------------------------------------------------------------------
 
 void setup() {
@@ -418,7 +428,7 @@ void setup() {
       g_model_loaded = false;
     } else {
       mqttDebugPrintln("Using SD card model");
-      loadModelMetadata("/models/model_metadata.json", currentModelMeta);
+      loadActiveModelMetadata();
       g_model_loaded = true;
     }
   }
@@ -947,6 +957,7 @@ bool reloadModel() {
     mqttDebugPrintf("Failed to load the new model from SD");
     return false;
   }
+  loadActiveModelMetadata();
   g_model_loaded = true;
   if (!setupInference()) {
     g_model_loaded = false;
