@@ -159,6 +159,14 @@ struct ModelMetadata {
 	float threshold;
 };
 
+struct ExitMetrics {
+	uint16_t mean;
+	uint16_t gradMean;        // 0..255-ish
+	uint16_t whitePermille;   // 0..1000
+	uint8_t  minv;
+	uint8_t  maxv;
+};
+
 // Forward declarations of functions
 void IRAM_ATTR ir_falling_isr();
 void checkResetReason();
@@ -234,6 +242,7 @@ void handleInferenceModeCommand(String modeStr);
 bool saveGrayscaleToSD(uint8_t* buf, int width, int height, const char* filename);
 uint32_t fnv1a_32(const uint8_t* data, size_t len);
 String makeImageName(const uint8_t* data, size_t len);
+bool isExitLike96(const uint8_t* img, int w, int h, ExitMetrics* out);
 // Add more handler functions as needed
 
 WiFiClient espClient;
@@ -666,7 +675,7 @@ void initializeEEPROM() {
   sensor_t * s = esp_camera_sensor_get();
   if (s != NULL) {
     s->set_framesize(s, FRAMESIZE_QVGA);
-    s->set_quality(s, 20);
+    s->set_quality(s, 5);
     s->set_brightness(s, -2);
     s->set_contrast(s, 1);
     s->set_whitebal(s, true);
@@ -681,7 +690,7 @@ void initializeEEPROM() {
 
   if (s != NULL) {
     s->set_framesize(s, FRAMESIZE_QVGA);
-    s->set_quality(s, 20);
+    s->set_quality(s, 5);
     s->set_brightness(s, -2);
     s->set_contrast(s, 1);
     s->set_whitebal(s, false);
@@ -1057,10 +1066,28 @@ TfLiteTensor* run_inference(uint8_t* input_data, size_t input_data_size) {
   // output->data.uint8[0] is the score for "prey"
   // output->data.uint8[1] is the score for "not_prey"
   // output->data.uint8[2] is the score for "not_cat" if used
-  
-  bool preyDetected = output->data.uint8[0] > output->data.uint8[1];
-  
+
   return output;
+}
+
+static inline float dequantize_u8_prob(const TfLiteTensor* tensor, uint8_t v) {
+  // For quantized softmax outputs this typically yields ~[0..1].
+  const float scale = tensor->params.scale;
+  const int zp = tensor->params.zero_point;
+  return (static_cast<int>(v) - zp) * scale;
+}
+
+static inline float dequantize_i8_value(const TfLiteTensor* tensor, int8_t v) {
+  const float scale = tensor->params.scale;
+  const int zp = tensor->params.zero_point;
+  return (static_cast<int>(v) - zp) * scale;
+}
+
+static inline float sigmoidf_safe(float x) {
+  // Guard against extreme values to avoid overflow.
+  if (x > 16.0f) return 0.9999999f;
+  if (x < -16.0f) return 0.0000001f;
+  return 1.0f / (1.0f + expf(-x));
 }
 
 // -------- JPEG Decode Infrastructure --------
@@ -1438,43 +1465,115 @@ void captureAndSendImage() {
     mqttDebugPrintf("LOCAL: decode done, gray_buf=%p, w=%d, h=%d\n", gray_buf, decoded_w, decoded_h);
     
     if (gray_buf && decoded_w == DECODE_WIDTH && decoded_h == DECODE_HEIGHT) {
-      // Crop centered 192x192 from QVGA (320x240), then resize to 96x96
-      const int cropSize = 192;
+      // Crop centered 192x192 square from decoded QVGA (320x240), then resize to 96x96.
       const int targetSize = 96;
-      int left = (decoded_w - cropSize) / 2;  // (320-192)/2 = 64
-      int top = (decoded_h - cropSize) / 2;   // (240-192)/2 = 24
+      const int cropSize = 192;
+      int left = (decoded_w - cropSize) / 2;
+      int top  = (decoded_h - cropSize) / 2;
       
       // Allocate inference buffer
       uint8_t *inference_buf = (uint8_t*)heap_caps_malloc(targetSize * targetSize, MALLOC_CAP_SPIRAM);
       if (inference_buf) {
-        // Resize 192x192 to 96x96 using nearest neighbor (2x downscale)
+        // Resize cropSize x cropSize to 96x96 using nearest neighbor.
+        const float scale = (float)cropSize / (float)targetSize;
         for (int y = 0; y < targetSize; y++) {
-          int srcY = top + y * 2;  // Scale factor 2
+          int srcY = top + (int)(y * scale);
+          if (srcY < 0) srcY = 0;
+          if (srcY >= decoded_h) srcY = decoded_h - 1;
           for (int x = 0; x < targetSize; x++) {
-            int srcX = left + x * 2;
+            int srcX = left + (int)(x * scale);
+            if (srcX < 0) srcX = 0;
+            if (srcX >= decoded_w) srcX = decoded_w - 1;
             inference_buf[y * targetSize + x] = gray_buf[srcY * decoded_w + srcX];
           }
         }
         cropResizeEndTime = millis();
-        
-        // Run inference on 96x96 grayscale
-        TfLiteTensor* inference_result = run_inference(inference_buf, targetSize * targetSize);
         bool esp32PreyDetected = false;
         String esp32Result = "";
-        
-        // assumes inference_result->data.uint8 has N scores
-        auto *scores = inference_result->data.uint8;
-        int num_scores = inference_result->dims->data[inference_result->dims->size - 1]; // typically 3
-        int max_inference_index = static_cast<int>(std::distance(scores,
-            std::max_element(scores, scores + num_scores)));
+        uint8_t max_score = 0;
+        float conf = NAN;
+        ExitMetrics exitMetrics;
+        if (!isExitLike96(inference_buf, targetSize, targetSize, &exitMetrics)) {
+          TfLiteTensor* inference_result = run_inference(inference_buf, targetSize * targetSize);
 
-        // max score if you need it:
-        uint8_t max_score = scores[max_inference_index];
+          if (!inference_result) {
+            esp32Result = currentModelMeta.numberOfLabels == 3 ? "not_cat" : "not_prey";
+            esp32PreyDetected = false;
+            max_score = 0;
+            conf = 0.0f;
+          } else {
+            int num_scores = inference_result->dims->data[inference_result->dims->size - 1];
 
-        switch (max_inference_index) {
-          case 0: esp32Result = "prey"; break;
-          case 1: esp32Result = "not_prey"; break;
-          case 2: esp32Result = "not_cat"; break;
+            // Two supported output modes:
+            // - uint8 probs: N>=2 scores (prey, not_prey, [not_cat])
+            // - int8 logits_margin: N==1 score (prey_logit - not_prey_logit)
+
+            if (inference_result->type == kTfLiteInt8 && num_scores == 1) {
+              const int8_t q_margin = inference_result->data.int8[0];
+              const float margin = dequantize_i8_value(inference_result, q_margin);
+              const float thr = currentModelMeta.threshold;  // margin threshold
+              const bool preyDetected = (margin >= thr);
+              const float prey_prob = sigmoidf_safe(margin);
+
+              esp32PreyDetected = preyDetected;
+              esp32Result = preyDetected ? "prey" : "not_prey";
+              conf = prey_prob;
+
+              mqttDebugPrintf("LOCAL: margin=%.3f thr=%.3f prey=%d prey_prob=%.3f\n",
+                              margin, thr, preyDetected ? 1 : 0, prey_prob);
+            } else {
+              // Default: assume uint8 softmax outputs.
+              auto *scores = inference_result->data.uint8;
+
+              // Use metadata threshold for prey instead of argmax / out0>out1.
+              const float prey_prob = dequantize_u8_prob(inference_result, scores[0]);
+              const float thr = currentModelMeta.threshold;
+              const bool preyDetected = (prey_prob >= thr);
+
+              int chosen_index = 0;
+              float chosen_prob = prey_prob;
+
+              if (preyDetected) {
+                chosen_index = 0;
+                chosen_prob = prey_prob;
+              } else {
+                // Choose best non-prey label.
+                chosen_index = 1;
+                for (int i = 2; i < num_scores; i++) {
+                  if (scores[i] > scores[chosen_index]) {
+                    chosen_index = i;
+                  }
+                }
+                chosen_prob = dequantize_u8_prob(inference_result, scores[chosen_index]);
+              }
+
+              esp32PreyDetected = preyDetected;
+              max_score = scores[chosen_index];
+              conf = chosen_prob;
+
+              switch (chosen_index) {
+                case 0: esp32Result = "prey"; break;
+                case 1: esp32Result = "not_prey"; break;
+                case 2: esp32Result = "not_cat"; break;
+                default: esp32Result = currentModelMeta.numberOfLabels == 3 ? "not_cat" : "not_prey"; break;
+              }
+
+              // Publish useful debug info for tuning
+              mqttDebugPrintf("LOCAL: prey_prob=%.3f thr=%.3f prey=%d chosen=%d conf=%.3f\n",
+                              prey_prob, thr, preyDetected ? 1 : 0, chosen_index, chosen_prob);
+            }
+          }
+
+        } else {
+          esp32Result = currentModelMeta.numberOfLabels == 3 ? "not_cat" : "not_prey";
+          esp32PreyDetected = false;
+          max_score = 255;
+          mqttDebugPrintf("Image classified as EXIT-like: mean=%d gradMean=%d whitePermille=%d min=%d max=%d\n",
+                          exitMetrics.mean,
+                          exitMetrics.gradMean,
+                          exitMetrics.whitePermille,
+                          exitMetrics.minv,
+                          exitMetrics.maxv);
         }
 
         inferenceEndTime = millis();
@@ -1485,7 +1584,15 @@ void captureAndSendImage() {
         StaticJsonDocument<256> doc;
         doc["hash"] = imgName;
         doc["label"] = esp32Result;
-        doc["confidence"] = max_score / 255.0f; // float
+        // Confidence: prefer the already-dequantized value (probabilities) or sigmoid(margin).
+        if (isnan(conf)) {
+          conf = max_score / 255.0f;
+          if (interpreter && interpreter->output(0)) {
+            TfLiteTensor* out = interpreter->output(0);
+            conf = dequantize_u8_prob(out, max_score);
+          }
+        }
+        doc["confidence"] = conf;
         doc["model"] = currentModelMeta.modelName; // const char*
 
         String payload;
@@ -1522,6 +1629,83 @@ void captureAndSendImage() {
   esp_camera_fb_return(fb);
 }
 
+// Compare variance without sqrt: var_num / (N*N) <= stdMax^2
+static bool isLowVariance(uint64_t sum, uint64_t sumsq, int N, uint16_t stdMax) {
+	uint64_t var_num = sumsq * (uint64_t)N - sum * sum;
+	uint64_t var_den = (uint64_t)N * (uint64_t)N;
+	uint64_t rhs = (uint64_t)stdMax * (uint64_t)stdMax * var_den;
+	return var_num <= rhs;
+}
+
+bool isExitLike96(const uint8_t* img, int w, int h, ExitMetrics* out) {
+	const int N = w * h;
+
+	// Tunables (start here, then tune from logs)
+	const uint8_t  WHITE_T        = 200;  // “very bright”
+	const uint16_t WHITE_FRAC_PPM = 450;  // 45% (permille)
+	const uint16_t GRAD_MAX       = 3;    // mean abs-neighbor-diff threshold (see below)
+	const uint16_t STD_MAX        = 18;   // only used in the white+uniform gate
+
+	uint64_t sum = 0;
+	uint64_t sumsq = 0;
+	uint32_t white = 0;
+	uint8_t mn = 255, mx = 0;
+
+	for (int i = 0; i < N; i++) {
+		uint8_t p = img[i];
+		sum += p;
+		sumsq += (uint64_t)p * (uint64_t)p;
+		if (p < mn) mn = p;
+		if (p > mx) mx = p;
+		if (p >= WHITE_T) white++;
+	}
+
+	uint16_t mean = (uint16_t)(sum / (uint64_t)N);
+	uint16_t whitePermille = (uint16_t)((white * 1000UL) / (uint32_t)N);
+
+	// Texture: mean absolute gradient (sample every 2px for speed)
+	uint32_t gradSum = 0;
+	uint32_t gradCnt = 0;
+	const int step = 2;
+
+	for (int y = 0; y < h - 1; y += step) {
+		const int row = y * w;
+		const int rowD = (y + 1) * w;
+
+		for (int x = 0; x < w - 1; x += step) {
+			uint8_t p  = img[row + x];
+			uint8_t pr = img[row + x + 1];
+			uint8_t pd = img[rowD + x];
+
+			gradSum += (p > pr) ? (p - pr) : (pr - p);
+			gradSum += (p > pd) ? (p - pd) : (pd - p);
+			gradCnt += 2;
+		}
+	}
+
+	uint16_t gradMean = (gradCnt > 0) ? (uint16_t)(gradSum / gradCnt) : 0;
+
+	// Decision
+	bool lowTexture = (gradMean <= GRAD_MAX);
+
+	// Extra safety for “blown out” cases
+	bool veryWhite = (whitePermille >= WHITE_FRAC_PPM);
+	bool uniform   = isLowVariance(sum, sumsq, N, STD_MAX);
+
+	bool isExit = lowTexture || (veryWhite && uniform);
+
+	if (out) {
+		out->mean = mean;
+		out->gradMean = gradMean;
+		out->whitePermille = whitePermille;
+		out->minv = mn;
+		out->maxv = mx;
+	}
+
+	return isExit;
+}
+
+
 // Function to crop a centered 384x384 square from the frame.
 // Returns a pointer to the cropped image data (allocated in PSRAM) or NULL on failure.
 camera_fb_t* cropFrame(camera_fb_t *fb) {
@@ -1530,6 +1714,11 @@ camera_fb_t* cropFrame(camera_fb_t *fb) {
   camera_fb_t *cropped = (camera_fb_t*) heap_caps_malloc(sizeof(camera_fb_t), MALLOC_CAP_SPIRAM);
   if (!cropped) {
       Serial.println("Failed to allocate memory for cropped frame struct");
+      return NULL;
+  }
+  if (fb->width < cropSize || fb->height < cropSize) {
+      Serial.println("Frame too small for 384x384 crop");
+      heap_caps_free(cropped);
       return NULL;
   }
   cropped->width  = cropSize;
@@ -3107,7 +3296,7 @@ void loadSettingsFromEEPROM() {
     if (s != NULL) {
         // JPEG Quality
         uint8_t qualityValue = EEPROM.read(EEPROM_BASE_LIVE_SETTINGS + CAM_OFFSET_QUALITY);
-        if (qualityValue >= 10 && qualityValue <= 63) {
+        if (qualityValue >= 0 && qualityValue <= 63) {
             s->set_quality(s, qualityValue);
         } else {
             mqttDebugPrintln("Invalid JPEG quality in EEPROM. Setting to default (30).");
@@ -3258,7 +3447,7 @@ void applyPresetFromEEPROM(uint8_t presetIndex) {
 
   // JPEG Quality
   uint8_t qualityValue = EEPROM.read(base + CAM_OFFSET_QUALITY);
-  if (qualityValue >= 10 && qualityValue <= 63) {
+  if (qualityValue >= 0 && qualityValue <= 63) {
     s->set_quality(s, qualityValue);
   }
 
