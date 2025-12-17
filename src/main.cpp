@@ -998,15 +998,17 @@ bool setupInference() {
   }
   
   // Create an op resolver with only the ops our model needs.
-  static tflite::MicroMutableOpResolver<10> resolver;
+  static tflite::MicroMutableOpResolver<12> resolver;
   resolver.AddCast();
   resolver.AddQuantize();
   resolver.AddDepthwiseConv2D();
   resolver.AddConv2D();
   resolver.AddMul();
   resolver.AddAdd();
+  resolver.AddSub();
   resolver.AddMaxPool2D();
   resolver.AddMean();
+  resolver.AddStridedSlice();
   resolver.AddFullyConnected();
   resolver.AddSoftmax();
   
