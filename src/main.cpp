@@ -263,7 +263,12 @@ uint8_t inferenceMode = INFERENCE_MODE_BOTH; // Default to both
 
 // Model comparison tracking
 String lastESP32Inference = "";
+String lastESP32Hash = "";
 String lastServerInference = "";
+String lastServerHash = "";
+static bool g_pendingServerResult = false;
+static String g_pendingServerHash = "";
+static String g_pendingServerLabel = "";
 unsigned long totalInferences = 0;
 unsigned long inferenceMatches = 0;
 unsigned long inferenceMismatches = 0;
@@ -324,6 +329,17 @@ static void serviceIrForMs(uint32_t durationMs)
     delay(1);
     yield();
   }
+}
+
+static inline void serviceMqttDuringWork()
+{
+  // PubSubClient only processes incoming packets when client.loop() runs.
+  // During long local inference/processing, keep this moving so server replies
+  // don't get artificially delayed until we're done.
+  if (client.connected()) {
+    client.loop();
+  }
+  yield();
 }
 
 
@@ -1468,7 +1484,7 @@ uint8_t* jpegToGrayscaleEsp32Jpeg(const uint8_t* jpg_buf, size_t jpg_len, int* o
   for (int i = 0; i < gray_pixels; i++) {
     g_decoded_gray_buf[i] = g_rgb_buf_espjpeg[i * 3];
     if ((i & 2047) == 0) {
-      yield();
+      serviceMqttDuringWork();
     }
   }
 
@@ -1517,7 +1533,7 @@ uint8_t* jpegToGrayscaleFallback(const uint8_t* jpg_buf, size_t jpg_len, int* ou
   for (int i = 0; i < DECODE_GRAY_SIZE; i++) {
     g_decoded_gray_buf[i] = g_rgb_buf[i * 3];
     if ((i & 2047) == 0) {
-      yield();
+      serviceMqttDuringWork();
     }
   }
 
@@ -1602,7 +1618,7 @@ void captureAndSendImage() {
         const float scale = (float)cropSize / (float)targetSize;
         for (int y = 0; y < targetSize; y++) {
           if ((y & 7) == 0) {
-            yield();
+            serviceMqttDuringWork();
           }
           int srcY = top + (int)(y * scale);
           if (srcY < 0) srcY = 0;
@@ -1708,6 +1724,7 @@ void captureAndSendImage() {
         // Publish result
         String imgName = makeImageName((uint8_t*)fb->buf, fb->len);
         lastESP32Inference = esp32Result;
+        lastESP32Hash = imgName;
         StaticJsonDocument<256> doc;
         doc["hash"] = imgName;
         doc["label"] = esp32Result;
@@ -1737,6 +1754,32 @@ void captureAndSendImage() {
                         esp32Result.c_str());
 
         client.publish(LOCAL_INFERENCE_TIME_TOPIC, String(inferenceEndTime - triggerStartTime).c_str(), true);
+
+        // If server result arrived while local inference was busy, compare now.
+        if (inferenceMode == INFERENCE_MODE_BOTH && g_pendingServerResult && g_pendingServerHash == imgName) {
+          lastServerInference = g_pendingServerLabel;
+          lastServerHash = g_pendingServerHash;
+          g_pendingServerResult = false;
+          g_pendingServerHash = "";
+          g_pendingServerLabel = "";
+
+          if (lastESP32Inference.length() > 0 && lastServerInference.length() > 0) {
+            if (lastESP32Inference == lastServerInference) {
+              inferenceMatches++;
+              mqttDebugPrintf("Inference MATCH: %s\n", lastESP32Inference.c_str());
+            } else {
+              inferenceMismatches++;
+              mqttDebugPrintf("Inference MISMATCH! ESP32=%s, Server=%s\n",
+                              lastESP32Inference.c_str(), lastServerInference.c_str());
+            }
+
+            float accuracy = totalInferences > 0 ? (float)inferenceMatches / totalInferences * 100.0 : 0.0;
+            String comparisonMsg = String("Matches: ") + inferenceMatches +
+                                  " / " + totalInferences +
+                                  " (" + String(accuracy, 1) + "%)";
+            client.publish(INFERENCE_COMPARISON_TOPIC, comparisonMsg.c_str(), true);
+          }
+        }
         
         // Make flap decision
         if (!detectionModeEnabled) {
@@ -1795,7 +1838,7 @@ bool isExitLike96(const uint8_t* img, int w, int h, ExitMetrics* out) {
 		if (p > mx) mx = p;
 		if (p >= WHITE_T) white++;
     if ((i & 2047) == 0) {
-      yield();
+      serviceMqttDuringWork();
     }
 	}
 
@@ -1809,7 +1852,7 @@ bool isExitLike96(const uint8_t* img, int w, int h, ExitMetrics* out) {
 
 	for (int y = 0; y < h - 1; y += step) {
     if ((y & 7) == 0) {
-      yield();
+      serviceMqttDuringWork();
     }
 		const int row = y * w;
 		const int rowD = (y + 1) * w;
@@ -2655,6 +2698,11 @@ void handleServerInference(String serverInferenceStr) {
 
   // Use parsed label for comparisons/state
   lastServerInference = parsedLabel;
+  String receivedHash = "";
+  if (!err) {
+    receivedHash = doc["hash"] | "";
+  }
+  lastServerHash = receivedHash;
   totalInferences++;
   
   // Print SERVER full round-trip timing
@@ -2671,22 +2719,50 @@ void handleServerInference(String serverInferenceStr) {
   client.publish(ROUNDTRIP_TOPIC, String(serverTotalMs).c_str(), true);
   
   // Compare ESP32 and Server results (only if both modes active)
-  if (inferenceMode == INFERENCE_MODE_BOTH && lastESP32Inference.length() > 0) {
-    if (lastESP32Inference == lastServerInference) {
-      inferenceMatches++;
-      mqttDebugPrintf("Inference MATCH: %s\n", lastESP32Inference.c_str());
+  if (inferenceMode == INFERENCE_MODE_BOTH) {
+    // If server provides a hash, only compare when it matches the local hash.
+    if (receivedHash.length() > 0) {
+      if (lastESP32Hash == receivedHash && lastESP32Inference.length() > 0) {
+        if (lastESP32Inference == lastServerInference) {
+          inferenceMatches++;
+          mqttDebugPrintf("Inference MATCH: %s\n", lastESP32Inference.c_str());
+        } else {
+          inferenceMismatches++;
+          mqttDebugPrintf("Inference MISMATCH! ESP32=%s, Server=%s\n",
+                          lastESP32Inference.c_str(), lastServerInference.c_str());
+        }
+
+        float accuracy = totalInferences > 0 ? (float)inferenceMatches / totalInferences * 100.0 : 0.0;
+        String comparisonMsg = String("Matches: ") + inferenceMatches +
+                              " / " + totalInferences +
+                              " (" + String(accuracy, 1) + "%)";
+        client.publish(INFERENCE_COMPARISON_TOPIC, comparisonMsg.c_str(), true);
+      } else {
+        // Local inference may still be running; hold this result until local publishes.
+        g_pendingServerResult = true;
+        g_pendingServerHash = receivedHash;
+        g_pendingServerLabel = parsedLabel;
+        mqttDebugPrintf("Server result received early (hash=%s); waiting for local\n", receivedHash.c_str());
+      }
     } else {
-      inferenceMismatches++;
-      mqttDebugPrintf("Inference MISMATCH! ESP32=%s, Server=%s\n", 
-                      lastESP32Inference.c_str(), lastServerInference.c_str());
+      // Backwards-compatible fallback: compare immediately (hash not available).
+      if (lastESP32Inference.length() > 0) {
+        if (lastESP32Inference == lastServerInference) {
+          inferenceMatches++;
+          mqttDebugPrintf("Inference MATCH: %s\n", lastESP32Inference.c_str());
+        } else {
+          inferenceMismatches++;
+          mqttDebugPrintf("Inference MISMATCH! ESP32=%s, Server=%s\n",
+                          lastESP32Inference.c_str(), lastServerInference.c_str());
+        }
+
+        float accuracy = totalInferences > 0 ? (float)inferenceMatches / totalInferences * 100.0 : 0.0;
+        String comparisonMsg = String("Matches: ") + inferenceMatches +
+                              " / " + totalInferences +
+                              " (" + String(accuracy, 1) + "%)";
+        client.publish(INFERENCE_COMPARISON_TOPIC, comparisonMsg.c_str(), true);
+      }
     }
-    
-    // Publish comparison stats
-    float accuracy = totalInferences > 0 ? (float)inferenceMatches / totalInferences * 100.0 : 0.0;
-    String comparisonMsg = String("Matches: ") + inferenceMatches + 
-                          " / " + totalInferences + 
-                          " (" + String(accuracy, 1) + "%)";
-    client.publish(INFERENCE_COMPARISON_TOPIC, comparisonMsg.c_str(), true);
   }
 }
 
