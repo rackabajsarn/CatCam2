@@ -37,6 +37,7 @@ const char* password = WIFI_PASSWORD;
 #define FREE_HEAP_TOPIC "catflap/free_heap"
 #define IR_PULSE_QUALITY_TOPIC "catflap/ir_pulse_quality"
 #define ROUNDTRIP_TOPIC "catflap/roundtrip"
+#define LOCAL_INFERENCE_TIME_TOPIC "catflap/local_inference_time"
 #define LOOPTIME_TOPIC "catflap/looptime"
 #define IP_TOPIC "catflap/ip"
 #define IMAGE_TOPIC "catflap/image"
@@ -79,7 +80,7 @@ const char* password = WIFI_PASSWORD;
 #define DEVICE_NAME "catflap"
 #define DEVICE_UNIQUE_ID "catflap_esp32"
 #define MQTT_DISCOVERY_PREFIX "homeassistant"
-#define DEVICE_SW_VERSION "1.1.0" //Increment together with git commits
+#define DEVICE_SW_VERSION "1.1.1" //Increment together with git commits
 
 // EEPROM Addresses
 #define EEPROM_SIZE 160
@@ -254,6 +255,7 @@ bool flapEnabled = true;  // Initialize flap state
 bool detectionModeEnabled = true;
 bool mqttDebugEnabled = true;
 bool catLocation = true; // true = home
+bool flapLockoutByPrey = false; // true if we auto-disabled flap due to prey
 bool barrierTriggered = false;  // Flag to indicate barrier has been triggered
 bool barrierStableState = false; // Last confirmed stable state (false = not broken, true = broken)
 esp_err_t cameraInitStatus = ESP_FAIL;
@@ -293,6 +295,7 @@ unsigned long inferenceEndTime = 0;      // TFLite inference complete
 // Debounce and Cooldown Settings
 float cooldownDuration = 0.0;    // Cooldown duration in seconds (default to 0)
 unsigned long lastBarrierClearedTime = 0;     // Timestamp of the last valid trigger
+unsigned long lastBarrierTriggerTime = 0;      // Timestamp of the last capture trigger
 unsigned long lastIrDebug = 0;
 
 uint8_t activeCameraPreset = 0; // 0 = day, 1 = night
@@ -302,10 +305,26 @@ static IrState g_candidate = IR_CLEAR;
 static uint32_t g_lastChangeMs = 0;      // when candidate changed
 static uint32_t g_lastStableMs = 0;      // last time we committed a stable change
 static bool g_irSensingEnabled = true;   // mask while IR is intentionally off
+static bool g_seenClearSinceBoot = false; // only allow triggers after at least one CLEAR
 static volatile uint32_t g_pulseCount = 0;    // count IR pulses for robust detection
+static volatile uint32_t g_lastPulseUs = 0;   // last time ISR saw a pulse edge (micros)
 static uint32_t g_lastPulseCheckMs = 0;       // last time we checked pulse count
 static uint32_t g_pulseQualitySum = 0;
 static uint32_t g_pulseQualitySamples = 0;
+
+static uint32_t g_lastIrRecoverMs = 0;
+
+static void serviceIrForMs(uint32_t durationMs)
+{
+  const uint32_t start = millis();
+  while (millis() - start < durationMs) {
+    ir_burst();
+    // Keep this short; if we call ir_burst too infrequently (e.g. 10ms),
+    // pulse counting will drop below threshold and look "BROKEN".
+    delay(1);
+    yield();
+  }
+}
 
 
 // The Tensor Arena memory area is used by TensorFlow Lite to store input, output and intermediate tensors
@@ -451,22 +470,45 @@ void setup() {
   
   // Start IR transmitter FIRST
   ir_init();
-  ir_on();
-  
-  // Give the IR carrier time to stabilize and TSOP to settle
-  delay(100);
-  
-  // NOW attach the interrupt and reset counters
+
+  // Start with IR off so the TSOP output is not already asserted when we
+  // attach the interrupt (otherwise we may miss the first edge and read 0
+  // pulses, incorrectly initializing as BROKEN).
+  ir_off();
+  delay(10);
+
+  // Attach the interrupt and reset counters
   g_pulseCount = 0;
   g_lastPulseCheckMs = millis();
   attachInterrupt(digitalPinToInterrupt(IR_PIN), ir_falling_isr, FALLING);
-  
-  // Wait for first valid reading
-  delay(PULSE_CHECK_INTERVAL + 5);  // Wait one pulse check interval
+
+  // Run a short burst warm-up during setup so the ISR accumulates pulses
+  // before we take the first reading.
+  {
+    const uint32_t warmupStart = millis();
+    while (millis() - warmupStart < (PULSE_CHECK_INTERVAL * 2U)) {
+      ir_burst();
+      delayMicroseconds(200);
+      yield();
+    }
+  }
+
+  // Force a pulse-window evaluation now.
+  g_lastPulseCheckMs = millis() - PULSE_CHECK_INTERVAL;
   IrState initialReading = readIrRaw();
   g_stable = initialReading;
   g_candidate = initialReading;
-  g_lastStableMs = millis();  // ← ADD THIS LINE
+  g_lastStableMs = millis();
+  g_lastChangeMs = g_lastStableMs;
+  g_seenClearSinceBoot = (initialReading == IR_CLEAR);
+
+  // Initialize cooldown baseline so we don't accidentally auto-trigger on boot
+  // due to an initial BROKEN reading.
+  lastBarrierClearedTime = g_lastStableMs;
+  lastBarrierTriggerTime = g_lastStableMs;
+  // If we boot into BROKEN (common before pulses have been observed), suppress
+  // the level-sensitive trigger until we've seen a CLEAR again.
+  barrierTriggered = (initialReading == IR_BROKEN);
 
   setup_wifi();
     // Disable Wi-Fi power save mode
@@ -517,9 +559,60 @@ void loop() {
 
   // Handle OTA updates
   ArduinoOTA.handle();
-  
+
+  // IR transmitter burst handling (run before reading barrier state so
+  // the pulse counter reflects recent activity).
+  ir_burst();
+
   // Handle IR barrier state
   updateIRBarrierState();
+
+  // If we boot up with 0 pulses and "detected" forever, auto-recover.
+  // This mirrors the manual "switch preset" workaround (detach/attach + reset).
+  if (g_irSensingEnabled) {
+    const uint32_t nowMs = millis();
+    // Only do this early after boot to avoid fighting a real cat blocking the beam.
+    if (nowMs > 2500 && nowMs < 60000 && (nowMs - g_lastIrRecoverMs) > 3000) {
+      const uint32_t nowUs = micros();
+      const uint32_t lastUs = g_lastPulseUs;
+      const bool noPulseRecently = (lastUs == 0) || ((nowUs - lastUs) > 800000);
+      if (noPulseRecently && g_stable == IR_BROKEN) {
+        g_lastIrRecoverMs = nowMs;
+        mqttDebugPrintf("IR recover: no pulses (raw=%d)\n", digitalRead(IR_PIN));
+
+        ir_off();
+        detachInterrupt(digitalPinToInterrupt(IR_PIN));
+        delay(5);
+        g_pulseCount = 0;
+        g_lastPulseUs = 0;
+        g_lastPulseCheckMs = millis();
+        attachInterrupt(digitalPinToInterrupt(IR_PIN), ir_falling_isr, FALLING);
+
+        // High-frequency warm-up so the ISR can see edges.
+        const uint32_t warmupStart = millis();
+        while (millis() - warmupStart < (PULSE_CHECK_INTERVAL * 2U)) {
+          ir_burst();
+          delayMicroseconds(200);
+          yield();
+        }
+
+        // Force a pulse-window evaluation and publish the current state.
+        g_lastPulseCheckMs = millis() - PULSE_CHECK_INTERVAL;
+        IrState reading = readIrRaw();
+        g_stable = reading;
+        g_candidate = reading;
+        g_lastStableMs = millis();
+        g_lastChangeMs = g_lastStableMs;
+        if (g_stable == IR_CLEAR) {
+          g_seenClearSinceBoot = true;
+          barrierTriggered = false;
+          client.publish(IR_BARRIER_TOPIC, "clear", true);
+        } else {
+          client.publish(IR_BARRIER_TOPIC, "broken", true);
+        }
+      }
+    }
+  }
 
   // Save settings to EEPROM if needed
   if (millis() - lastSettingsChangeTime > SETTINGS_SAVE_DELAY && lastSettingsChangeTime != 0) {
@@ -531,7 +624,7 @@ void loop() {
   //delay(10);  // Small delay to prevent watchdog resets
   
   // IR transmitter burst handling
-  ir_burst();
+  // (moved earlier in loop)
 
 
 
@@ -556,6 +649,7 @@ void IRAM_ATTR ir_falling_isr() {
   // TSOP output is active LOW when it detects IR carrier
   // Just count pulses - much more robust than timing individual edges
   g_pulseCount++;
+  g_lastPulseUs = micros();
 }
 
 void ir_init()
@@ -729,7 +823,8 @@ void setup_wifi() {
 
   // Wait for connection
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    // Keep IR burst running even while we block in setup.
+    serviceIrForMs(500);
     Serial.print(".");
   }
   
@@ -752,7 +847,7 @@ void mqttConnect() {
       Serial.print("failed, rc=");
       Serial.print(client.state());
       Serial.println(" trying again in 5 seconds");
-      delay(5000);
+      serviceIrForMs(5000);
     }
   }
 }
@@ -772,7 +867,7 @@ void mqttReconnect() {
       Serial.print("failed, rc=");
       Serial.print(client.state());
       Serial.println(" trying again in 5 seconds");
-      delay(5000);
+      serviceIrForMs(5000);
     }
   }
 }
@@ -1050,8 +1145,29 @@ TfLiteTensor* run_inference(uint8_t* input_data, size_t input_data_size) {
                   input_data_size, input->bytes);
     return nullptr;  // or handle the error as needed
   }
-  // Copy the input data into the input tensor.
-  memcpy(input->data.uint8, input_data, input_data_size);
+  // Copy/quantize the input into the model's input tensor.
+  if (input->type == kTfLiteUInt8) {
+    memcpy(input->data.uint8, input_data, input_data_size);
+  } else if (input->type == kTfLiteInt8) {
+    // Our pipeline produces grayscale pixels in [0..255]. The model expects values in [0..1]
+    // quantized using the input tensor's (scale, zero_point).
+    const float scale = input->params.scale;
+    const int zp = input->params.zero_point;
+    if (scale <= 0.0f) {
+      mqttDebugPrintln("run_inference: invalid input scale");
+      return nullptr;
+    }
+    for (size_t i = 0; i < input_data_size; i++) {
+      const float real01 = static_cast<float>(input_data[i]) * (1.0f / 255.0f);
+      int32_t q = static_cast<int32_t>(lroundf(real01 / scale)) + zp;
+      if (q < -128) q = -128;
+      if (q > 127) q = 127;
+      input->data.int8[i] = static_cast<int8_t>(q);
+    }
+  } else {
+    mqttDebugPrintf("run_inference: unsupported input tensor type %d\n", input->type);
+    return nullptr;
+  }
   // Run inference.
   TfLiteStatus invoke_status = interpreter->Invoke();
   if (invoke_status != kTfLiteOk) {
@@ -1351,6 +1467,9 @@ uint8_t* jpegToGrayscaleEsp32Jpeg(const uint8_t* jpg_buf, size_t jpg_len, int* o
 
   for (int i = 0; i < gray_pixels; i++) {
     g_decoded_gray_buf[i] = g_rgb_buf_espjpeg[i * 3];
+    if ((i & 2047) == 0) {
+      yield();
+    }
   }
 
   mqttDebugPrintf("ESP32_JPEG: decode OK, w=%d h=%d\n", *out_width, *out_height);
@@ -1397,6 +1516,9 @@ uint8_t* jpegToGrayscaleFallback(const uint8_t* jpg_buf, size_t jpg_len, int* ou
   // Convert RGB888 to grayscale (use R channel)
   for (int i = 0; i < DECODE_GRAY_SIZE; i++) {
     g_decoded_gray_buf[i] = g_rgb_buf[i * 3];
+    if ((i & 2047) == 0) {
+      yield();
+    }
   }
 
   mqttDebugPrintf("Fallback: fmt2rgb888 decode OK, w=%d h=%d\n", *out_width, *out_height);
@@ -1479,6 +1601,9 @@ void captureAndSendImage() {
         // Resize cropSize x cropSize to 96x96 using nearest neighbor.
         const float scale = (float)cropSize / (float)targetSize;
         for (int y = 0; y < targetSize; y++) {
+          if ((y & 7) == 0) {
+            yield();
+          }
           int srcY = top + (int)(y * scale);
           if (srcY < 0) srcY = 0;
           if (srcY >= decoded_h) srcY = decoded_h - 1;
@@ -1508,21 +1633,21 @@ void captureAndSendImage() {
 
             // Two supported output modes:
             // - uint8 probs: N>=2 scores (prey, not_prey, [not_cat])
-            // - int8 logits_margin: N==1 score (prey_logit - not_prey_logit)
+            // - int8 logit-like score: N==1 (new `logit` export, or legacy `logits_margin`)
 
             if (inference_result->type == kTfLiteInt8 && num_scores == 1) {
-              const int8_t q_margin = inference_result->data.int8[0];
-              const float margin = dequantize_i8_value(inference_result, q_margin);
-              const float thr = currentModelMeta.threshold;  // margin threshold
-              const bool preyDetected = (margin >= thr);
-              const float prey_prob = sigmoidf_safe(margin);
+              const int8_t q_score = inference_result->data.int8[0];
+              const float logit = dequantize_i8_value(inference_result, q_score);
+              const float thr = currentModelMeta.threshold;  // logit threshold
+              const bool preyDetected = (logit >= thr);
+              const float prey_prob = sigmoidf_safe(logit);
 
               esp32PreyDetected = preyDetected;
               esp32Result = preyDetected ? "prey" : "not_prey";
               conf = prey_prob;
 
-              mqttDebugPrintf("LOCAL: margin=%.3f thr=%.3f prey=%d prey_prob=%.3f\n",
-                              margin, thr, preyDetected ? 1 : 0, prey_prob);
+              mqttDebugPrintf("LOCAL: logit=%.3f thr=%.3f prey=%d prey_prob=%.3f\n",
+                              logit, thr, preyDetected ? 1 : 0, prey_prob);
             } else {
               // Default: assume uint8 softmax outputs.
               auto *scores = inference_result->data.uint8;
@@ -1610,12 +1735,21 @@ void captureAndSendImage() {
                         inferenceEndTime - cropResizeEndTime,
                         inferenceEndTime - triggerStartTime,
                         esp32Result.c_str());
+
+        client.publish(LOCAL_INFERENCE_TIME_TOPIC, String(inferenceEndTime - triggerStartTime).c_str(), true);
         
         // Make flap decision
-        if (esp32PreyDetected) {
+        if (!detectionModeEnabled) {
+          // Still run inference/capture, but don't actuate flap.
+        } else if (esp32PreyDetected) {
           handleFlapStateCommand("OFF");
+          flapLockoutByPrey = true;
         } else {
-          handleFlapStateCommand("ON");
+          // Only auto-enable if we previously auto-disabled due to prey.
+          if (flapLockoutByPrey) {
+            handleFlapStateCommand("ON");
+            flapLockoutByPrey = false;
+          }
         }
         
         heap_caps_free(inference_buf);
@@ -1660,6 +1794,9 @@ bool isExitLike96(const uint8_t* img, int w, int h, ExitMetrics* out) {
 		if (p < mn) mn = p;
 		if (p > mx) mx = p;
 		if (p >= WHITE_T) white++;
+    if ((i & 2047) == 0) {
+      yield();
+    }
 	}
 
 	uint16_t mean = (uint16_t)(sum / (uint64_t)N);
@@ -1671,6 +1808,9 @@ bool isExitLike96(const uint8_t* img, int w, int h, ExitMetrics* out) {
 	const int step = 2;
 
 	for (int y = 0; y < h - 1; y += step) {
+    if ((y & 7) == 0) {
+      yield();
+    }
 		const int row = y * w;
 		const int rowD = (y + 1) * w;
 
@@ -2392,10 +2532,10 @@ void publishDiscoveryConfigs() {
   serializeJson(freeHeapSensorConfig, freeHeapSensorConfigPayload);
   client.publish(freeHeapSensorConfigTopic.c_str(), freeHeapSensorConfigPayload.c_str(), true);
 
-    // Roundtrip Time Sensor
+  // Server Inference Time Sensor (formerly "Roundtrip time")
   String roundtripSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/roundtrip/config";
   DynamicJsonDocument roundtripSensorConfig(512);
-  roundtripSensorConfig["name"] = "Roundtrip time";
+  roundtripSensorConfig["name"] = "Server Inference Time";
   roundtripSensorConfig["state_topic"] = ROUNDTRIP_TOPIC;
   roundtripSensorConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_roundtrip";
   roundtripSensorConfig["unit_of_measurement"] = "ms";
@@ -2406,6 +2546,21 @@ void publishDiscoveryConfigs() {
   String roundtripSensorConfigPayload;
   serializeJson(roundtripSensorConfig, roundtripSensorConfigPayload);
   client.publish(roundtripSensorConfigTopic.c_str(), roundtripSensorConfigPayload.c_str(), true);
+
+  // Local Inference Time Sensor
+  String localInferenceTimeSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/local_inference_time/config";
+  DynamicJsonDocument localInferenceTimeSensorConfig(512);
+  localInferenceTimeSensorConfig["name"] = "Local Inference Time";
+  localInferenceTimeSensorConfig["state_topic"] = LOCAL_INFERENCE_TIME_TOPIC;
+  localInferenceTimeSensorConfig["unique_id"] = String(DEVICE_UNIQUE_ID) + "_local_inference_time";
+  localInferenceTimeSensorConfig["unit_of_measurement"] = "ms";
+  localInferenceTimeSensorConfig["entity_category"] = "diagnostic";
+  localInferenceTimeSensorConfig["state_class"] = "measurement";
+  JsonObject deviceInfoLocalInferenceTime = localInferenceTimeSensorConfig.createNestedObject("device");
+  deviceInfoLocalInferenceTime["identifiers"] = DEVICE_UNIQUE_ID;
+  String localInferenceTimeSensorConfigPayload;
+  serializeJson(localInferenceTimeSensorConfig, localInferenceTimeSensorConfigPayload);
+  client.publish(localInferenceTimeSensorConfigTopic.c_str(), localInferenceTimeSensorConfigPayload.c_str(), true);
 
   // Looptime Sensor
   String looptimeSensorConfigTopic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_NAME + "/looptime/config";
@@ -2443,16 +2598,41 @@ void publishDiscoveryConfigs() {
 
 // TODO: Inference handled on device. compare inference from device and from mqtt
 void handleInferenceTopic(String inferenceStr) {
+  // Detection mode requirements:
+  // - still process in/out events and capture/inference as usual
+  // - but do NOT change "Allow Entry" unless Detection mode is ON
   if (inferenceStr == "not_cat"){
-    /* code */
+    // no-op
   } else if (inferenceStr == "cat_morris_entering") {
     handleCatLocationCommand("ON");
+    if (detectionModeEnabled && flapLockoutByPrey) {
+      handleFlapStateCommand("ON");
+      flapLockoutByPrey = false;
+    }
   } else if (inferenceStr == "cat_morris_leaving") {
     handleCatLocationCommand("OFF");
+    if (detectionModeEnabled && flapLockoutByPrey) {
+      handleFlapStateCommand("ON");
+      flapLockoutByPrey = false;
+    }
   } else if (inferenceStr == "unknow_cat_entering") {
-    /* code */
+    // Treat as a cat event for unlocking purposes.
+    if (detectionModeEnabled && flapLockoutByPrey) {
+      handleFlapStateCommand("ON");
+      flapLockoutByPrey = false;
+    }
+  } else if (inferenceStr == "not_prey") {
+    if (detectionModeEnabled && flapLockoutByPrey) {
+      handleFlapStateCommand("ON");
+      flapLockoutByPrey = false;
+    }
   } else if (inferenceStr == "prey") {
-    handleFlapStateCommand("OFF");
+    if (detectionModeEnabled) {
+      handleFlapStateCommand("OFF");
+      flapLockoutByPrey = true;
+    } else {
+      mqttDebugPrintln("Detection mode OFF: ignoring prey flap lockout");
+    }
   }
 }
 
@@ -2487,6 +2667,8 @@ void handleServerInference(String serverInferenceStr) {
                   serverInferenceLatency,
                   serverTotalMs,
                   parsedLabel.c_str());
+
+  client.publish(ROUNDTRIP_TOPIC, String(serverTotalMs).c_str(), true);
   
   // Compare ESP32 and Server results (only if both modes active)
   if (inferenceMode == INFERENCE_MODE_BOTH && lastESP32Inference.length() > 0) {
@@ -2712,22 +2894,36 @@ void handleAgcGainCommand(String valueStr) {
 void handleIRBarrierStateChange(bool barrierBroken) {
   unsigned long currentTime = millis();
   if (barrierBroken) {
-    if (currentTime - lastBarrierClearedTime >= (cooldownDuration * 1000)) {
+    // Always publish the stable state change.
+    client.publish(IR_BARRIER_TOPIC, "broken", true);
 
+    // Prevent spurious startup triggers: require that we've seen at least one
+    // stable CLEAR since boot before we ever start triggering captures.
+    if (!g_seenClearSinceBoot) {
+      barrierTriggered = true; // suppress level-trigger until we see CLEAR
+      mqttDebugPrintln("Barrier BROKEN but no CLEAR seen since boot; ignoring");
+      return;
+    }
+
+    const unsigned long cdMs = (unsigned long)(cooldownDuration * 1000.0f);
+    if (currentTime - lastBarrierTriggerTime >= cdMs) {
       // Mark start of trigger chain (barrier -> inference)
       triggerStartTime = currentTime;
-
-      // Publish IR barrier state
-      client.publish(IR_BARRIER_TOPIC, "broken", true);
-      
+      barrierTriggered = true;
+      lastBarrierTriggerTime = currentTime;
       captureAndSendImage();
-
     } else {
-      mqttDebugPrintln("Trigger ignored due to cooldown");
+      // Important: this broken edge happened during cooldown.
+      // Leave barrierTriggered=false so we can trigger once cooldown expires
+      // even if the beam stays broken (no new edge).
+      barrierTriggered = false;
+      mqttDebugPrintln("Trigger ignored due to cooldown (pending)");
     }
   } else {
     // Update on falling edge
     lastBarrierClearedTime = currentTime;
+    barrierTriggered = false;  // Arm next broken episode
+    g_seenClearSinceBoot = true;
 
     // Publish IR barrier state
     client.publish(IR_BARRIER_TOPIC, "clear", true);
@@ -2876,6 +3072,21 @@ void updateIRBarrierState()
     g_lastStableMs = now;
 
     handleIRBarrierStateChange(g_stable == IR_BROKEN);
+  }
+
+  // If a broken edge happened during cooldown, we might never get another edge
+  // while the beam remains broken. Make the trigger level-sensitive while
+  // broken: once cooldown expires, fire exactly once.
+  if (g_stable == IR_BROKEN && !barrierTriggered) {
+    const unsigned long cdMs = (unsigned long)(cooldownDuration * 1000.0f);
+    if (g_seenClearSinceBoot && now - lastBarrierTriggerTime >= cdMs) {
+      client.publish(IR_BARRIER_TOPIC, "broken", true);
+      triggerStartTime = now;
+      barrierTriggered = true;
+      lastBarrierTriggerTime = now;
+      mqttDebugPrintln("Cooldown expired while barrier still broken; triggering");
+      captureAndSendImage();
+    }
   }
 }
 
