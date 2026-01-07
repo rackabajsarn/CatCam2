@@ -317,17 +317,30 @@ static uint32_t g_lastPulseCheckMs = 0;       // last time we checked pulse coun
 static uint32_t g_pulseQualitySum = 0;
 static uint32_t g_pulseQualitySamples = 0;
 
+static TaskHandle_t g_irBurstTaskHandle = nullptr;
+
 static uint32_t g_lastIrRecoverMs = 0;
 
 static void serviceIrForMs(uint32_t durationMs)
 {
   const uint32_t start = millis();
   while (millis() - start < durationMs) {
-    ir_burst();
-    // Keep this short; if we call ir_burst too infrequently (e.g. 10ms),
-    // pulse counting will drop below threshold and look "BROKEN".
     delay(1);
     yield();
+  }
+}
+
+static void irBurstTask(void *param)
+{
+  (void)param;
+  for (;;) {
+    // Keep the IR burst "clock" running even when the main loop is busy
+    // (e.g. Snapshot/local inference). Guard with the same flag used to mask
+    // sensing during critical sections so we don't turn IR back on.
+    if (g_irSensingEnabled) {
+      ir_burst();
+    }
+    vTaskDelay(1);  // ~1ms tick
   }
 }
 
@@ -498,16 +511,22 @@ void setup() {
   g_lastPulseCheckMs = millis();
   attachInterrupt(digitalPinToInterrupt(IR_PIN), ir_falling_isr, FALLING);
 
+  // Run IR bursting in the background so barrier sensing doesn't stall during
+  // long-running operations (Snapshot/local inference).
+  if (!g_irBurstTaskHandle) {
+    xTaskCreatePinnedToCore(
+      irBurstTask,
+      "ir_burst",
+      2048,
+      nullptr,
+      1,
+      &g_irBurstTaskHandle,
+      0);
+  }
+
   // Run a short burst warm-up during setup so the ISR accumulates pulses
   // before we take the first reading.
-  {
-    const uint32_t warmupStart = millis();
-    while (millis() - warmupStart < (PULSE_CHECK_INTERVAL * 2U)) {
-      ir_burst();
-      delayMicroseconds(200);
-      yield();
-    }
-  }
+  delay(PULSE_CHECK_INTERVAL * 2U);
 
   // Force a pulse-window evaluation now.
   g_lastPulseCheckMs = millis() - PULSE_CHECK_INTERVAL;
@@ -576,10 +595,6 @@ void loop() {
   // Handle OTA updates
   ArduinoOTA.handle();
 
-  // IR transmitter burst handling (run before reading barrier state so
-  // the pulse counter reflects recent activity).
-  ir_burst();
-
   // Handle IR barrier state
   updateIRBarrierState();
 
@@ -604,13 +619,8 @@ void loop() {
         g_lastPulseCheckMs = millis();
         attachInterrupt(digitalPinToInterrupt(IR_PIN), ir_falling_isr, FALLING);
 
-        // High-frequency warm-up so the ISR can see edges.
-        const uint32_t warmupStart = millis();
-        while (millis() - warmupStart < (PULSE_CHECK_INTERVAL * 2U)) {
-          ir_burst();
-          delayMicroseconds(200);
-          yield();
-        }
+        // Warm-up so the ISR can see edges.
+        delay(PULSE_CHECK_INTERVAL * 2U);
 
         // Force a pulse-window evaluation and publish the current state.
         g_lastPulseCheckMs = millis() - PULSE_CHECK_INTERVAL;
