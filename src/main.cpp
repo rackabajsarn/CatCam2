@@ -311,13 +311,12 @@ static uint32_t g_lastChangeMs = 0;      // when candidate changed
 static uint32_t g_lastStableMs = 0;      // last time we committed a stable change
 static bool g_irSensingEnabled = true;   // mask while IR is intentionally off
 static bool g_seenClearSinceBoot = false; // only allow triggers after at least one CLEAR
+static volatile bool g_otaInProgress = false;
 static volatile uint32_t g_pulseCount = 0;    // count IR pulses for robust detection
 static volatile uint32_t g_lastPulseUs = 0;   // last time ISR saw a pulse edge (micros)
 static uint32_t g_lastPulseCheckMs = 0;       // last time we checked pulse count
 static uint32_t g_pulseQualitySum = 0;
 static uint32_t g_pulseQualitySamples = 0;
-
-static TaskHandle_t g_irBurstTaskHandle = nullptr;
 
 static uint32_t g_lastIrRecoverMs = 0;
 
@@ -330,25 +329,16 @@ static void serviceIrForMs(uint32_t durationMs)
   }
 }
 
-static void irBurstTask(void *param)
-{
-  (void)param;
-  for (;;) {
-    // Keep the IR burst "clock" running even when the main loop is busy
-    // (e.g. Snapshot/local inference). Guard with the same flag used to mask
-    // sensing during critical sections so we don't turn IR back on.
-    if (g_irSensingEnabled) {
-      ir_burst();
-    }
-    vTaskDelay(1);  // ~1ms tick
-  }
-}
-
 static inline void serviceMqttDuringWork()
 {
   // PubSubClient only processes incoming packets when client.loop() runs.
   // During long local inference/processing, keep this moving so server replies
-  // don't get artificially delayed until we're done.
+  // don't get artificially delayed until we're done. 
+  if (g_irSensingEnabled) {
+    ir_burst();
+  }
+  // OTA also needs frequent servicing, otherwise uploads can fail during long loops.
+  ArduinoOTA.handle();
   if (client.connected()) {
     client.loop();
   }
@@ -502,7 +492,7 @@ void setup() {
 
   // Start with IR off so the TSOP output is not already asserted when we
   // attach the interrupt (otherwise we may miss the first edge and read 0
-  // pulses, incorrectly initializing as BROKEN).
+  // pulses, incorrectly initializing as BROKEN). 
   ir_off();
   delay(10);
 
@@ -510,19 +500,6 @@ void setup() {
   g_pulseCount = 0;
   g_lastPulseCheckMs = millis();
   attachInterrupt(digitalPinToInterrupt(IR_PIN), ir_falling_isr, FALLING);
-
-  // Run IR bursting in the background so barrier sensing doesn't stall during
-  // long-running operations (Snapshot/local inference).
-  if (!g_irBurstTaskHandle) {
-    xTaskCreatePinnedToCore(
-      irBurstTask,
-      "ir_burst",
-      2048,
-      nullptr,
-      1,
-      &g_irBurstTaskHandle,
-      0);
-  }
 
   // Run a short burst warm-up during setup so the ISR accumulates pulses
   // before we take the first reading.
@@ -594,6 +571,17 @@ void loop() {
 
   // Handle OTA updates
   ArduinoOTA.handle();
+
+  // During OTA flashing, avoid heavy work that can cause timeouts.
+  if (g_otaInProgress) {
+    delay(1);
+    return;
+  }
+
+  // Drive IR transmitter so pulse counting stays alive.
+  if (g_irSensingEnabled) {
+    ir_burst();
+  }
 
   // Handle IR barrier state
   updateIRBarrierState();
@@ -1552,6 +1540,10 @@ uint8_t* jpegToGrayscaleFallback(const uint8_t* jpg_buf, size_t jpg_len, int* ou
 }
 
 void captureAndSendImage() {
+  if (g_otaInProgress) {
+    mqttDebugPrintln("captureAndSendImage: OTA in progress, skipping capture");
+    return;
+  }
   if (cameraInitStatus != ESP_OK) {
     mqttDebugPrintln("captureAndSendImage: camera not initialized");
     return;
@@ -3185,6 +3177,7 @@ void setupOTA() {
   // ArduinoOTA.setPassword("password123");
 
   ArduinoOTA.onStart([]() {
+    g_otaInProgress = true;
     String type;
     if (ArduinoOTA.getCommand() == U_FLASH)
       type = "sketch";
@@ -3194,12 +3187,14 @@ void setupOTA() {
     Serial.println("Start updating " + type);
   });
   ArduinoOTA.onEnd([]() {
+    g_otaInProgress = false;
     Serial.println("\nEnd");
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
   });
   ArduinoOTA.onError([](ota_error_t error) {
+    g_otaInProgress = false;
     Serial.printf("Error[%u]: ", error);
     if (error == OTA_AUTH_ERROR)
       Serial.println("Auth Failed");
